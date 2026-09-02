@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  FRONTDESK
+  TECHNICIAN
+  MARKETING
+  ANALYTICS
+  OPERATOR
+}
+
+enum AppointmentStatus {
+  BOOKED
+  CONFIRMED
+  ON_THE_WAY
+  ARRIVED
+  SCAN_STARTED
+  SCAN_DONE
+  REPORT_DELIVERED
+  CANCELLED
+}
+
+model User {
+  id             String        @id @default(cuid())
+  email          String        @unique
+  name           String
+  passwordHash   String
+  role           Role
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  appointments   Appointment[] @relation("CreatedAppointments")
+  audits         AuditLog[]
+  activities     ActivityLog[]
+  statusChanges  StatusHistory[]
+  locationId     String?
+  location       Location?     @relation(fields: [locationId], references: [id])
+  testTypes      TestType[]
+  canCreateAppointments Boolean @default(false)
+  createdNotices Notice[]      @relation("CreatedNotices")
+  noticeReads    NoticeRead[]  @relation("ReadNotices")
+}
+
+model TestType {
+  id                String                  @id @default(cuid())
+  name              String                  @unique
+  active            Boolean                 @default(true)
+  instructions      String?
+  slots             SlotConfiguration[]
+  bookings          Appointment[]
+  technicians       User[]
+  workDays          String[]                @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
+  locationSchedules TestLocationSchedule[]
+  notices           Notice[]
+}
+
+model Location {
+  id                String                  @id @default(cuid())
+  name              String                  @unique
+  active            Boolean                 @default(true)
+  showContactToTechnicians Boolean          @default(false)
+  qrCodeUrl         String?
+  mapLink           String?
+  address           String?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  slots             SlotConfiguration[]
+  bookings          Appointment[]
+  users             User[]
+  locationSchedules TestLocationSchedule[]
+  notices           Notice[]
+}
+
+model SlotConfiguration {
+  id         String    @id @default(cuid())
+  testId     String
+  locationId String?
+  label      String
+  sortOrder  Int
+  capacity   Int
+  active     Boolean   @default(true)
+  dayOfWeek  String    @default("All")
+  test       TestType  @relation(fields: [testId], references: [id])
+  location   Location? @relation(fields: [locationId], references: [id])
+
+  @@unique([testId, locationId, dayOfWeek, label])
+}
+
+model TestLocationSchedule {
+  id         String   @id @default(cuid())
+  testId     String
+  locationId String
+  workDays   String[] @default([])
+  test       TestType @relation(fields: [testId], references: [id])
+  location   Location @relation(fields: [locationId], references: [id])
+
+  @@unique([testId, locationId])
+}
+
+model Appointment {
+  id               String            @id @default(cuid())
+  bookingId        String            @unique
+  patientName      String
+  phoneNumber      String?
+  patientAge       String?
+  appointmentDate  DateTime
+  slot             String
+  referredBy       String?
+  referredDoctor   String?
+  cityHospital     String?
+  notes            String?
+  status           AppointmentStatus @default(BOOKED)
+  testId           String
+  subTest          String?
+  isPregnant       Boolean?
+  preferredDoctor  String?
+  locationId       String?
+  createdById      String
+  totalPrice       Float?
+  advanceReceived  Float?
+  advanceMethod    String?
+  remainingMethod  String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  test             TestType          @relation(fields: [testId], references: [id])
+  location         Location?         @relation(fields: [locationId], references: [id])
+  createdBy        User              @relation("CreatedAppointments", fields: [createdById], references: [id])
+  audits           AuditLog[]
+  activities       ActivityLog[]
+  statusHistory    StatusHistory[]
+
+  @@index([appointmentDate, testId, slot])
+  @@index([phoneNumber])
+  @@index([patientName])
+  @@index([status])
+  @@index([locationId])
+}
+
+model AuditLog {
+  id            String       @id @default(cuid())
+  appointmentId String?
+  userId        String
+  action        String
+  ipAddress     String?
+  browser       String?
+  oldValue      Json?
+  newValue      Json?
+  createdAt     DateTime     @default(now())
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+  user          User         @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+}
+
+model ActivityLog {
+  id            String       @id @default(cuid())
+  appointmentId String
+  userId        String
+  message       String
+  createdAt     DateTime     @default(now())
+  appointment   Appointment  @relation(fields: [appointmentId], references: [id])
+  user          User         @relation(fields: [userId], references: [id])
+}
+
+model StatusHistory {
+  id            String            @id @default(cuid())
+  appointmentId String
+  userId        String
+  fromStatus    AppointmentStatus?
+  toStatus      AppointmentStatus
+  createdAt     DateTime          @default(now())
+  appointment   Appointment       @relation(fields: [appointmentId], references: [id])
+  user          User              @relation(fields: [userId], references: [id])
+}
+
+model ExportJob {
+  id        String   @id @default(cuid())
+  userId    String
+  format    String
+  filters   Json
+  createdAt DateTime @default(now())
+}
+
+model Notice {
+  id          String       @id @default(cuid())
+  title       String
+  message     String
+  startDate   DateTime
+  endDate     DateTime
+  locationId  String?
+  testId      String?
+  active      Boolean      @default(true)
+  createdById String
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  createdBy   User         @relation("CreatedNotices", fields: [createdById], references: [id])
+  location    Location?    @relation(fields: [locationId], references: [id])
+  test        TestType?    @relation(fields: [testId], references: [id])
+  reads       NoticeRead[]
+
+  @@index([endDate, active])
+}
+
+model NoticeRead {
+  id       String   @id @default(cuid())
+  noticeId String
+  userId   String
+  readAt   DateTime @default(now())
+  notice   Notice   @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  user     User     @relation("ReadNotices", fields: [userId], references: [id])
+
+  @@unique([noticeId, userId])
+}
+model ProName {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isCustom  Boolean  @default(false)
+  createdAt DateTime @default(now())
+}

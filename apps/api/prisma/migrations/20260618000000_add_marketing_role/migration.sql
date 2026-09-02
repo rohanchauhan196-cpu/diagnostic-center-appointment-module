@@ -1,0 +1,2 @@
+-- AddValue
+ALTER TYPE "Role" ADD VALUE 'MARKETING';

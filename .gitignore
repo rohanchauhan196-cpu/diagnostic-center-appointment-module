@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js / Build outputs
+.next/
+out/
+build/
+dist/
+apps/web/.next/
+apps/api/dist/
+
+# Environment files (keep secret)
+.env
+.env.local
+.env.*.local
+
+# Logs & temp text logs
+logs/
+*.log
+*.txt
+api_logs.txt
+web_logs.txt
+
+# Scratch and deployment scripts containing server secrets
+*.py
+*.ps1
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# TypeScript cache
+*.tsbuildinfo
