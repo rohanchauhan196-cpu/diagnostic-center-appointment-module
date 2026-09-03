@@ -41,7 +41,7 @@ type DashboardUser = {
   active: boolean;
 };
 
-type Test = { id: string; name: string; active?: boolean };
+type Test = { id: string; name: string; active?: boolean; instructions?: string | null };
 
 // Use local date to avoid UTC-timezone mismatch where frontdesk bookings don't show
 function todayLocal() {
@@ -162,6 +162,7 @@ export default function DashboardPage() {
   const openMessagePopup = (appt: Appointment) => {
     const d = new Date(appt.appointmentDate);
     const formattedDate = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const matchingTest = tests.find(t => t.name.toLowerCase() === appt.test.name.toLowerCase());
     
     setPopupData({
       patientName: appt.patientName,
@@ -172,10 +173,11 @@ export default function DashboardPage() {
       totalPrice: appt.totalPrice || 0,
       locationName: appt.location?.name || "",
       bookedBy: appt.createdBy?.name || "Unknown Agent",
-      instructions: appt.test.instructions || null,
+      instructions: matchingTest?.instructions || appt.test.instructions || null,
       mapLink: appt.location?.mapLink || null,
       qrCodeUrl: appt.location?.qrCodeUrl || null,
       address: appt.location?.address || null,
+      proName: appt.referredBy || null,
     });
     setIsPopupOpen(true);
   };

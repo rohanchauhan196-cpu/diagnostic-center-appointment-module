@@ -1,5 +1,6 @@
 import "dotenv/config";
 import cors from "cors";
+import compression from "compression";
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -42,6 +43,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage })
 
 app.use(cors());
+app.use(compression());
 app.use(express.json());
 app.use("/uploads", express.static(path.join(process.cwd(), "public", "uploads")));
 

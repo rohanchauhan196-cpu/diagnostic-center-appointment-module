@@ -51,8 +51,8 @@ function isSaturdayDate(dateInput: string | Date): boolean {
 
 function include() {
   return {
-    test: true,
-    location: true,
+    test: { select: { id: true, name: true, active: true } },
+    location: { select: { id: true, name: true, active: true, qrCodeUrl: true, mapLink: true, address: true, showContactToTechnicians: true } },
     createdBy: { select: { id: true, name: true, email: true } }
   };
 }
