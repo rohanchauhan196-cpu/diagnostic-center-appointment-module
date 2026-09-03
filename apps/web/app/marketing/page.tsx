@@ -61,10 +61,10 @@ export default function MarketingLeadsPage() {
   });
   const marketingAgents = allUsers.filter((u) => u.role === "MARKETING");
 
-  // Fetch all appointments (no date filter — we filter client-side by month)
+  // Fetch appointments created by MARKETING role (server-filtered for speed)
   const { data: allAppointments = [], isLoading } = useQuery({
     queryKey: ["marketing-appointments"],
-    queryFn: () => api<Appointment[]>("/appointments"),
+    queryFn: () => api<Appointment[]>("/appointments?creatorRole=MARKETING"),
   });
 
   // Filter to only MARKETING-created appointments

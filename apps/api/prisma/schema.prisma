@@ -136,6 +136,11 @@ model Appointment {
   activities       ActivityLog[]
   statusHistory    StatusHistory[]
 
+  @@index([locationId, testId, appointmentDate, status])
+  @@index([appointmentDate, locationId])
+  @@index([updatedAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@index([createdById, appointmentDate])
   @@index([appointmentDate, testId, slot])
   @@index([phoneNumber])
   @@index([patientName])

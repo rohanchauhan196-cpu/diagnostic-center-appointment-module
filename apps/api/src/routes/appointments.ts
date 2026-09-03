@@ -123,6 +123,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
       ...testFilter,
       ...locationFilter,
       ...(req.query.createdById ? { createdById: String(req.query.createdById) } : {}),
+      ...(req.query.creatorRole ? { createdBy: { role: req.query.creatorRole as any } } : {}),
       ...(req.query.referredBy ? {
         OR: [
           { referredBy: String(req.query.referredBy) },
@@ -131,6 +132,9 @@ appointmentsRouter.get("/", async (req, res, next) => {
             { referredBy: { contains: req.user.name, mode: "insensitive" as const } }
           ] : [])
         ]
+      } : {}),
+      ...(req.query.futureOnly === "true" ? {
+        appointmentDate: { gte: new Date(new Date().setHours(0, 0, 0, 0)) }
       } : {}),
       ...(q ? { OR: [
         { patientName: { contains: q, mode: "insensitive" } },
@@ -155,6 +159,8 @@ appointmentsRouter.get("/", async (req, res, next) => {
         ? [{ appointmentDate: sortOrder }, { slot: sortOrder }]
         : [{ [orderByField]: sortOrder }];
 
+      const isAdmin = req.user?.role === "ADMIN";
+
       const [total, rows, aggregateResult, statusCounts, advanceCountResult] = await Promise.all([
         prisma.appointment.count({ where }),
         prisma.appointment.findMany({
@@ -164,10 +170,12 @@ appointmentsRouter.get("/", async (req, res, next) => {
           skip,
           take: limit
         }),
-        prisma.appointment.aggregate({
-          where,
-          _sum: { totalPrice: true, advanceReceived: true }
-        }),
+        isAdmin
+          ? prisma.appointment.aggregate({
+              where,
+              _sum: { totalPrice: true, advanceReceived: true }
+            })
+          : Promise.resolve({ _sum: { totalPrice: null, advanceReceived: null } }),
         prisma.appointment.groupBy({
           by: ["status"],
           where,
@@ -195,7 +203,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
         }
       });
 
-      const responseRows = (req.user?.role === "ADMIN" || req.user?.role === "FRONTDESK" || req.user?.role === "TECHNICIAN")
+      const responseRows = (isAdmin || req.user?.role === "FRONTDESK" || req.user?.role === "TECHNICIAN")
         ? rows
         : rows.map(r => ({
             ...r,
@@ -219,15 +227,17 @@ appointmentsRouter.get("/", async (req, res, next) => {
           completed,
           cancelled,
           advanceCount: advanceCountResult,
-          totalRevenue: (req.user?.role === "ADMIN") ? totalRevenue : null,
-          totalPendingPayment: (req.user?.role === "ADMIN") ? totalPendingPayment : null
+          totalRevenue: isAdmin ? totalRevenue : null,
+          totalPendingPayment: isAdmin ? totalPendingPayment : null
         }
       });
     } else {
+      const unpaginatedLimit = req.query.limit ? Math.max(Number(req.query.limit), 1) : (q ? 50 : undefined);
       const rows = await prisma.appointment.findMany({
         where,
         include: include(),
-        orderBy: [{ appointmentDate: "asc" }, { slot: "asc" }]
+        orderBy: [{ appointmentDate: "asc" }, { slot: "asc" }],
+        take: unpaginatedLimit
       });
       const responseRows = (req.user?.role === "ADMIN" || req.user?.role === "FRONTDESK" || req.user?.role === "TECHNICIAN")
         ? rows

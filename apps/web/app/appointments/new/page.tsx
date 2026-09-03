@@ -81,21 +81,38 @@ export default function NewAppointmentPage() {
   const cleanName = patientName.trim();
   const cleanPhone = phoneNumber.trim().replace(/\s+/g, "");
 
+  const [debouncedName, setDebouncedName] = useState("");
+  const [debouncedPhone, setDebouncedPhone] = useState("");
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedName(cleanName);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [cleanName]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedPhone(cleanPhone);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [cleanPhone]);
+
   const { data: proNames = [] } = useQuery<{ id: string; name: string }[]>({
     queryKey: ["pro-names"],
     queryFn: () => api<{ id: string; name: string }[]>("/pro-names"),
   });
 
   const { data: nameAppointments = [] } = useQuery({
-    queryKey: ["appointments", "search-name", cleanName],
-    enabled: cleanName.length >= 3,
-    queryFn: () => api<Appointment[]>(`/appointments?q=${encodeURIComponent(cleanName)}`),
+    queryKey: ["appointments", "search-name", debouncedName],
+    enabled: debouncedName.length >= 3,
+    queryFn: () => api<Appointment[]>(`/appointments?q=${encodeURIComponent(debouncedName)}&futureOnly=true&limit=20`),
   });
 
   const { data: phoneAppointments = [] } = useQuery({
-    queryKey: ["appointments", "search-phone", cleanPhone],
-    enabled: cleanPhone.length >= 5,
-    queryFn: () => api<Appointment[]>(`/appointments?q=${encodeURIComponent(cleanPhone)}`),
+    queryKey: ["appointments", "search-phone", debouncedPhone],
+    enabled: debouncedPhone.length >= 5,
+    queryFn: () => api<Appointment[]>(`/appointments?q=${encodeURIComponent(debouncedPhone)}&futureOnly=true&limit=20`),
   });
 
   const matchingAppointments = useMemo(() => {
