@@ -312,9 +312,6 @@ appointmentsRouter.get("/availability", async (req, res, next) => {
     next(error);
   }
 });
- 
-
-appointmentsRouter.get("/slot")
 
 appointmentsRouter.get("/upcoming-availability", async (req, res, next) => {
   try {

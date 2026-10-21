@@ -25,8 +25,7 @@ CURRENT="$APP_ROOT/current"
 HISTORY="$APP_ROOT/history.log"
 APPLIED_MIGRATIONS="$APP_ROOT/applied-migrations.txt"
 KEEP_RELEASES=3
-API_HEALTH=http://127.0.0.1:4000/health
-WEB_HEALTH=http://127.0.0.1:3000/login
+WEB_PORT=3500 # must match ecosystem.config.cjs
 
 export PATH=/usr/local/bin:/usr/bin:/bin
 # Optional overrides (e.g. PATH for a non-system Node install).
@@ -51,8 +50,9 @@ link_shared() {
   local dir=$1
   [ -f "$SHARED/env/root.env" ] && ln -sfn "$SHARED/env/root.env" "$dir/.env"
   ln -sfn "$SHARED/env/api.env" "$dir/apps/api/.env"
-  # NEXT_PUBLIC_* values are baked in at build time, so this must exist before building.
+  # NEXT_PUBLIC_* values are baked in at build time, so these must exist before building.
   [ -f "$SHARED/env/web.env" ] && ln -sfn "$SHARED/env/web.env" "$dir/apps/web/.env"
+  [ -f "$SHARED/env/web.env.production" ] && ln -sfn "$SHARED/env/web.env.production" "$dir/apps/web/.env.production"
   mkdir -p "$dir/apps/api/public"
   ln -sfn "$SHARED/uploads" "$dir/apps/api/public/uploads"
 }
@@ -114,9 +114,11 @@ switch_to() {
 }
 
 healthy() {
-  local i
+  local i api_port
+  api_port=$(grep -E '^API_PORT=' "$SHARED/env/api.env" | head -1 | cut -d= -f2- | tr -d '"'\''[:space:]')
   for i in $(seq 1 30); do
-    if curl -fsS -o /dev/null --max-time 5 "$API_HEALTH" && curl -fsS -o /dev/null --max-time 5 "$WEB_HEALTH"; then
+    if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:${api_port:-4000}/health" \
+      && curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:${WEB_PORT}/login"; then
       return 0
     fi
     sleep 2

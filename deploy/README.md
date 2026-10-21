@@ -78,24 +78,23 @@ sudo -u deploy git clone --mirror git@github.com:rohanchauhan196-cpu/diagnostic-
 
 ### 3. Move env files and uploads into `shared/`
 
-Find where the running app reads them first:
-
-```bash
-pm2 jlist | python3 -c "import json,sys;[print(p['name'],p['pm2_env']['pm_cwd']) for p in json.load(sys.stdin)]"
-find /home/ubuntu/diagnostic-center-system -path '*/node_modules' -prune -o -type d -name uploads -print
-```
-
-Then copy (adjust source paths to what the commands above showed):
+The current app (checked 2026-10-21) runs from `/home/ubuntu/diagnostic-center-system`:
+web on port 3500 (PM2 env), API on `API_PORT=4500` from `apps/api/.env`, uploads (~35 MB)
+in `apps/api/public/uploads`.
 
 ```bash
 OLD=/home/ubuntu/diagnostic-center-system
 S=/home/deploy/diagnostic/shared
-sudo cp $OLD/apps/api/.env $S/env/api.env
-sudo cp $OLD/apps/web/.env $S/env/web.env        # if it exists
-sudo cp $OLD/.env          $S/env/root.env       # if it exists
+sudo cp $OLD/apps/api/.env            $S/env/api.env
+sudo cp $OLD/apps/web/.env            $S/env/web.env
+sudo cp $OLD/apps/web/.env.production $S/env/web.env.production
+sudo cp $OLD/.env                     $S/env/root.env
 sudo rsync -a $OLD/apps/api/public/uploads/ $S/uploads/
-sudo chown -R deploy:deploy $S && sudo chmod 600 $S/env/*.env
+sudo chown -R deploy:deploy $S && sudo chmod 600 $S/env/*
 ```
+
+Uploads made between this copy and the cut-over (step 5) must be copied again right
+before cutting over: `sudo rsync -a $OLD/apps/api/public/uploads/ $S/uploads/ && sudo chown -R deploy:deploy $S/uploads`.
 
 ### 4. Key for GitHub Actions
 
@@ -130,22 +129,35 @@ goes ahead safely if the commit's code matches what prod runs today (same schema
 ```bash
 SHA=<commit on main to go live with>
 sudo -u deploy /home/deploy/bin/deploy.sh prepare $SHA     # builds; site still running the old way
-pm2 delete diagnostic-api diagnostic-web && pm2 save       # as ubuntu: old processes stop (downtime starts)
+sudo rsync -a /home/ubuntu/diagnostic-center-system/apps/api/public/uploads/ /home/deploy/diagnostic/shared/uploads/
+sudo chown -R deploy:deploy /home/deploy/diagnostic/shared/uploads
+# as ubuntu: stops ONLY these two; the other PM2 apps on this server keep running (downtime starts)
+pm2 delete diagnostic-api diagnostic-web && pm2 save
 sudo -u deploy /home/deploy/bin/deploy.sh deploy $SHA      # starts under deploy (seconds)
 sudo env PATH=$PATH pm2 startup systemd -u deploy --hp /home/deploy   # start on reboot
 ```
 
-nginx needs no change: the apps still listen on 3000 (web) and 4000 (API).
+nginx needs no change: the apps still listen on 3500 (web) and 4500 (API).
 Check the site, uploads and logins, then test a rollback from GitHub Actions once.
 
 ### 6. Lock the server down
 
 Once your own SSH key login works:
 
+`sshd_config.d/60-cloudimg-settings.conf` already says `PasswordAuthentication no`, yet
+password logins still worked on 2026-10-21, and `PermitRootLogin yes` is set. Check what
+sshd actually uses, then turn off every password path:
+
 ```bash
-sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sudo grep -rl PasswordAuthentication /etc/ssh/sshd_config.d/ | xargs -r sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/'
+sudo sshd -T | grep -E 'passwordauthentication|kbdinteractiveauthentication|permitrootlogin|usepam'
+sudo tee /etc/ssh/sshd_config.d/00-hardening.conf >/dev/null <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+EOF
 sudo sshd -t && sudo systemctl reload ssh
+sudo sshd -T | grep -E 'passwordauthentication|kbdinteractiveauthentication|permitrootlogin'
+# keep this session open and confirm a NEW key-based login works before closing it
 sudo apt install -y fail2ban
 ```
 
