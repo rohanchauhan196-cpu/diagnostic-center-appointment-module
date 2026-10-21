@@ -3,6 +3,12 @@ import type { NextFunction, Request, Response } from "express";
 import { Role } from "@prisma/client";
 import { prisma } from "../config/db.js";
 
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 16) {
+  // A missing/weak secret would let anyone forge login tokens — refuse to start.
+  throw new Error("JWT_SECRET must be set to a long random value (at least 16 characters). Generate one with: openssl rand -base64 32");
+}
+export const JWT_SECRET = process.env.JWT_SECRET;
+
 export type AuthUser = {
   id: string;
   email: string;
@@ -25,7 +31,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ message: "Missing token" });
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "dev-secret") as { sub: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as { sub: string };
     const user = await prisma.user.findUnique({
       where: { id: decoded.sub },
       include: { testTypes: { select: { id: true, name: true } } }

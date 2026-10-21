@@ -1,6 +1,7 @@
 "use client";
 
 import { io } from "socket.io-client";
+import { getToken } from "./auth";
 
 const getSocketUrl = () => {
   if (process.env.NEXT_PUBLIC_SOCKET_URL && !process.env.NEXT_PUBLIC_SOCKET_URL.includes("localhost")) {
@@ -16,5 +17,7 @@ const getSocketUrl = () => {
 };
 
 export const socket = io(getSocketUrl(), {
-  autoConnect: false
+  autoConnect: false,
+  // Evaluated on every (re)connect so a fresh login token is always sent.
+  auth: (cb) => cb({ token: getToken() })
 });

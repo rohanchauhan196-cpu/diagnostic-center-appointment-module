@@ -1,21 +1,55 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../config/db.js";
-import { requireAuth } from "../middleware/auth.js";
+import { Role } from "@prisma/client";
+import { requireAuth, requireRole } from "../middleware/auth.js";
 import { activity, audit } from "../services/audit.js";
-import { assertSlotHasCapacity, dayRange, slotAvailability } from "../services/slots.js";
+import { assertSlotHasCapacity, slotAvailability, upcomingAvailability } from "../services/slots.js";
+import { dayNameOf, dayRange, toDateStr, todayStr } from "../services/time.js";
 import { emitRealtime } from "../config/socket.js";
+import type { AuthUser } from "../middleware/auth.js";
 
 export const appointmentsRouter = Router();
 appointmentsRouter.use(requireAuth);
 
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+const SCAN_STATUSES = ["ARRIVED", "SCAN_STARTED", "SCAN_DONE", "REPORT_DELIVERED"] as const;
+const READ_ONLY_ROLES = ["ANALYTICS"];
+
+/** Technicians and operators only see appointments for their allotted center and test types. */
+function isOutOfScope(user: AuthUser, appt: { locationId: string | null; testId: string }) {
+  if (user.role !== "TECHNICIAN" && user.role !== "OPERATOR") return false;
+  if (user.locationId && appt.locationId !== user.locationId) return true;
+  if (user.testTypes && user.testTypes.length > 0 && !user.testTypes.some((t) => t.id === appt.testId)) return true;
+  return false;
+}
+
+/** Technicians only see the patient phone when their center allows it. */
+function hidePhoneFrom(user: AuthUser, appt: { location?: { showContactToTechnicians: boolean } | null }) {
+  return user.role === "TECHNICIAN" && !appt.location?.showContactToTechnicians;
+}
+
+function forViewer<T extends { phoneNumber: string | null; totalPrice: number | null; advanceReceived: number | null; location?: { showContactToTechnicians: boolean } | null }>(user: AuthUser, appt: T): T {
+  const canSeePayments = user.role === "ADMIN" || user.role === "FRONTDESK" || user.role === "TECHNICIAN";
+  return {
+    ...appt,
+    ...(canSeePayments ? {} : { totalPrice: null, advanceReceived: null }),
+    ...(hidePhoneFrom(user, appt) ? { phoneNumber: null } : {})
+  };
+}
+
 const appointmentBody = z.object({
   patientName: z.string().min(2).transform(s => s.trim()),
-  phoneNumber: z.string().regex(/^\+?[0-9]{10,15}$/, "Phone must be 10–15 digits").or(z.literal("")).optional().nullable(),
+  phoneNumber: z.string().regex(/^[0-9]{10}$/, "Phone must be exactly 10 digits").or(z.literal("")).optional().nullable(),
   patientAge: z.string().optional().nullable(),
   testId: z.string(),
   locationId: z.string(),
-  appointmentDate: z.string(),
+  appointmentDate: z.string().regex(/^\d{4}-\d{2}-\d{2}/, "Date must be YYYY-MM-DD"),
   slot: z.string(),
   referredBy: z.string().optional(),
   referredDoctor: z.string().optional().nullable(),
@@ -28,6 +62,8 @@ const appointmentBody = z.object({
   subTest: z.string().optional().nullable(),
   isPregnant: z.boolean().optional().nullable(),
   preferredDoctor: z.string().optional().nullable(),
+  scanName: z.string().max(500).optional().nullable(),
+  prescriptionUrl: z.string().max(1000).optional().nullable(),
 });
 
 function parseAgeInYears(ageStr: string): number | null {
@@ -42,11 +78,7 @@ function parseAgeInYears(ageStr: string): number | null {
 }
 
 function isSaturdayDate(dateInput: string | Date): boolean {
-  const dateStr = dateInput instanceof Date ? dateInput.toISOString() : String(dateInput);
-  const datePart = dateStr.slice(0, 10); // YYYY-MM-DD
-  const [year, month, day] = datePart.split("-").map(Number);
-  const localAppDate = new Date(year, month - 1, day);
-  return localAppDate.getDay() === 6;
+  return dayNameOf(dateInput) === "Saturday";
 }
 
 function include() {
@@ -61,11 +93,11 @@ appointmentsRouter.get("/", async (req, res, next) => {
   try {
     const q = String(req.query.q || "");
     const dateQuery = String(req.query.date || "");
-    const date = (dateQuery && dateQuery !== "undefined") ? dayRange(dateQuery) : undefined;
+    const date = /^\d{4}-\d{2}-\d{2}/.test(dateQuery) ? dayRange(dateQuery) : undefined;
 
     const isOperator = req.user?.role === "OPERATOR";
     // For Machine Operator: force date to today's date range (only same day appointments)
-    const effectiveDate = isOperator ? dayRange(new Date()) : date;
+    const effectiveDate = isOperator ? dayRange(todayStr()) : date;
 
     // Enforce locationId for technicians and operators if they have one allotted
     let locationFilter: any = {};
@@ -117,14 +149,23 @@ appointmentsRouter.get("/", async (req, res, next) => {
       statusFilter = { status: String(req.query.status) };
     }
 
-    const where: any = {
-      ...(effectiveDate ? { appointmentDate: { gte: effectiveDate.start, lt: effectiveDate.end } } : {}),
-      ...statusFilter,
-      ...testFilter,
-      ...locationFilter,
-      ...(req.query.createdById ? { createdById: String(req.query.createdById) } : {}),
-      ...(req.query.creatorRole ? { createdBy: { role: req.query.creatorRole as any } } : {}),
-      ...(req.query.referredBy ? {
+    // Filters that touch the same field (date ranges, OR groups) are combined
+    // with AND so one filter can never silently overwrite another.
+    const and: any[] = [];
+    if (effectiveDate) {
+      and.push({ appointmentDate: { gte: effectiveDate.start, lt: effectiveDate.end } });
+    } else if (req.query.month) {
+      // Month filter: format "YYYY-MM" — applied only when no specific date is set
+      const [yyyy, mm] = String(req.query.month).split("-").map(Number);
+      if (!isNaN(yyyy) && !isNaN(mm) && mm >= 1 && mm <= 12) {
+        and.push({ appointmentDate: { gte: new Date(Date.UTC(yyyy, mm - 1, 1)), lt: new Date(Date.UTC(yyyy, mm, 1)) } });
+      }
+    }
+    if (req.query.futureOnly === "true") {
+      and.push({ appointmentDate: { gte: dayRange(todayStr()).start } });
+    }
+    if (req.query.referredBy) {
+      and.push({
         OR: [
           { referredBy: String(req.query.referredBy) },
           { createdById: String(req.query.referredBy) },
@@ -132,22 +173,36 @@ appointmentsRouter.get("/", async (req, res, next) => {
             { referredBy: { contains: req.user.name, mode: "insensitive" as const } }
           ] : [])
         ]
+      });
+    }
+    if (q) {
+      and.push({
+        OR: [
+          { patientName: { contains: q, mode: "insensitive" } },
+          { phoneNumber: { contains: q } },
+          { bookingId: { contains: q, mode: "insensitive" } },
+          { referredBy: { contains: q, mode: "insensitive" } },
+          { notes: { contains: q, mode: "insensitive" } }
+        ]
+      });
+    }
+
+    const creatorRole = String(req.query.creatorRole || "");
+    const where: any = {
+      ...statusFilter,
+      ...testFilter,
+      ...locationFilter,
+      ...(req.query.createdById ? { createdById: String(req.query.createdById) } : {}),
+      ...(Object.values(Role).includes(creatorRole as Role) ? { createdBy: { role: creatorRole as Role } } : {}),
+      ...(req.query.proName ? {
+        referredBy: { equals: String(req.query.proName), mode: "insensitive" as const }
       } : {}),
-      ...(req.query.futureOnly === "true" ? {
-        appointmentDate: { gte: new Date(new Date().setHours(0, 0, 0, 0)) }
-      } : {}),
-      ...(q ? { OR: [
-        { patientName: { contains: q, mode: "insensitive" } },
-        { phoneNumber: { contains: q } },
-        { bookingId: { contains: q, mode: "insensitive" } },
-        { referredBy: { contains: q, mode: "insensitive" } },
-        { notes: { contains: q, mode: "insensitive" } }
-      ] } : {})
+      ...(and.length > 0 ? { AND: and } : {})
     };
 
     if (req.query.page) {
-      const page = Math.max(Number(req.query.page), 1);
-      const limit = Math.max(Number(req.query.limit || 50), 1);
+      const page = Math.max(Number(req.query.page) || 1, 1);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
       const skip = (page - 1) * limit;
 
       // Support custom sort for Recent mode
@@ -160,6 +215,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
         : [{ [orderByField]: sortOrder }];
 
       const isAdmin = req.user?.role === "ADMIN";
+      const aggregateWhere = where.status ? where : { ...where, status: { not: "CANCELLED" as const } };
 
       const [total, rows, aggregateResult, statusCounts, advanceCountResult] = await Promise.all([
         prisma.appointment.count({ where }),
@@ -172,7 +228,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
         }),
         isAdmin
           ? prisma.appointment.aggregate({
-              where,
+              where: aggregateWhere,
               _sum: { totalPrice: true, advanceReceived: true }
             })
           : Promise.resolve({ _sum: { totalPrice: null, advanceReceived: null } }),
@@ -183,7 +239,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
         }),
         prisma.appointment.count({
           where: {
-            ...where,
+            ...aggregateWhere,
             advanceReceived: { gt: 0 }
           }
         })
@@ -196,20 +252,14 @@ appointmentsRouter.get("/", async (req, res, next) => {
         const count = c._count.status;
         if (["BOOKED", "CONFIRMED", "ON_THE_WAY"].includes(c.status)) {
           pending += count;
-        } else if (["ARRIVED"].includes(c.status)) {
+        } else if ((SCAN_STATUSES as readonly string[]).includes(c.status)) {
           completed += count;
         } else if (c.status === "CANCELLED") {
           cancelled += count;
         }
       });
 
-      const responseRows = (isAdmin || req.user?.role === "FRONTDESK" || req.user?.role === "TECHNICIAN")
-        ? rows
-        : rows.map(r => ({
-            ...r,
-            totalPrice: null,
-            advanceReceived: null
-          }));
+      const responseRows = rows.map((r) => forViewer(req.user!, r));
 
       const totalRevenue = aggregateResult._sum.totalPrice ?? 0;
       const totalAdvance = aggregateResult._sum.advanceReceived ?? 0;
@@ -239,14 +289,7 @@ appointmentsRouter.get("/", async (req, res, next) => {
         orderBy: [{ appointmentDate: "asc" }, { slot: "asc" }],
         take: unpaginatedLimit
       });
-      const responseRows = (req.user?.role === "ADMIN" || req.user?.role === "FRONTDESK" || req.user?.role === "TECHNICIAN")
-        ? rows
-        : rows.map(r => ({
-            ...r,
-            totalPrice: null,
-            advanceReceived: null
-          }));
-      res.json(responseRows);
+      res.json(rows.map((r) => forViewer(req.user!, r)));
     }
   } catch (error) {
     next(error);
@@ -260,72 +303,50 @@ appointmentsRouter.get("/availability", async (req, res, next) => {
     const date = String(req.query.date);
     const ignoreAppointmentId = req.query.ignoreAppointmentId ? String(req.query.ignoreAppointmentId) : undefined;
     
-    if (!testId || !locationId || !date || testId === "undefined" || locationId === "undefined") {
+    if (!testId || !locationId || !/^\d{4}-\d{2}-\d{2}/.test(date) || testId === "undefined" || locationId === "undefined") {
       return res.json([]);
     }
-    
+
     res.json(await slotAvailability(prisma, testId, locationId, date, ignoreAppointmentId));
+  } catch (error) {
+    next(error);
+  }
+});
+ 
+
+appointmentsRouter.get("/slot")
+
+appointmentsRouter.get("/upcoming-availability", async (req, res, next) => {
+  try {
+    const testId = String(req.query.testId);
+    const locationId = String(req.query.locationId);
+    const requested = String(req.query.startDate || "");
+    // Never start before today in the center's timezone (browser UTC dates can lag by a day).
+    const startDate = /^\d{4}-\d{2}-\d{2}/.test(requested) && requested.slice(0, 10) > todayStr() ? requested : todayStr();
+    const days = Math.min(Math.max(parseInt(String(req.query.days || "7"), 10) || 7, 1), 14);
+
+    if (!testId || !locationId || testId === "undefined" || locationId === "undefined") {
+      return res.json([]);
+    }
+
+    res.json(await upcomingAvailability(prisma, testId, locationId, startDate, days));
   } catch (error) {
     next(error);
   }
 });
 
 function validateAppointmentDate(dateInput: string | Date) {
-  const dateStr = dateInput instanceof Date ? dateInput.toISOString() : String(dateInput);
-  const datePart = dateStr.slice(0, 10); // YYYY-MM-DD
-  const [year, month, day] = datePart.split("-").map(Number);
-  const localAppDate = new Date(year, month - 1, day);
-
-  // Backdate check
-  const today = new Date();
-  const todayLocal = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  if (localAppDate < todayLocal) {
-    throw new Error("Bookings cannot be scheduled for past dates.");
+  if (toDateStr(dateInput) < todayStr()) {
+    throw new HttpError(400, "Bookings cannot be scheduled for past dates.");
   }
 }
-
-/** Validate that the selected day is allowed for the test at the given location.
- *  Checks per-center schedule (TestLocationSchedule) first; falls back to
- *  the global TestType.workDays.  If neither restricts, the day is allowed. */
-async function validateWorkDayForCenter(testId: string, locationId: string, dateStr: string) {
-  const datePart = String(dateStr).slice(0, 10);
-  const [year, month, day] = datePart.split("-").map(Number);
-  const localDate = new Date(year, month - 1, day);
-  const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-  const dayName = DAYS[localDate.getDay()];
-
-  // 1. Check per-center override (safe fallback if table not yet on client)
-  try {
-    const centerSchedule = await (prisma as any).testLocationSchedule.findUnique({
-      where: { testId_locationId: { testId, locationId } }
-    });
-
-    if (centerSchedule && centerSchedule.workDays.length > 0) {
-      if (!centerSchedule.workDays.includes(dayName)) {
-        const location = await prisma.location.findUnique({ where: { id: locationId }, select: { name: true } });
-        throw new Error(`This test is not available at ${location?.name ?? "this center"} on ${dayName}s.`);
-      }
-      return; // per-center schedule says OK
-    }
-  } catch (e: any) {
-    // If the error is our own validation error, rethrow it
-    if (e?.message?.includes("not available")) throw e;
-    // Otherwise table not ready — fall through to global check
-  }
-
-  // 2. Fall back to global TestType.workDays
-  const test = await prisma.testType.findUnique({ where: { id: testId }, select: { workDays: true, name: true } });
-  if (test && test.workDays && test.workDays.length > 0) {
-    if (!test.workDays.includes(dayName)) {
-      throw new Error(`"${test.name}" is not available on ${dayName}s.`);
-    }
-  }
-}
-
 
 appointmentsRouter.post("/", async (req, res, next) => {
   try {
     const body = appointmentBody.parse(req.body);
+    if (READ_ONLY_ROLES.includes(req.user!.role) || req.user!.role === "OPERATOR") {
+      return res.status(403).json({ message: "Your account cannot create appointments." });
+    }
     if (req.user?.role !== "ADMIN" && req.user?.role !== "FRONTDESK") {
       delete body.totalPrice;
       delete body.advanceReceived;
@@ -349,8 +370,6 @@ appointmentsRouter.post("/", async (req, res, next) => {
       }
     }
     validateAppointmentDate(body.appointmentDate);
-    // Validate working day per-center (or fallback to global)
-    await validateWorkDayForCenter(body.testId, body.locationId, body.appointmentDate);
 
     // Enforce patientAge if test is DTPA
     const test = await prisma.testType.findUnique({
@@ -404,8 +423,9 @@ appointmentsRouter.post("/", async (req, res, next) => {
     // Allow same phone number for multiple bookings (e.g. different family members) on the same day/location
 
     const appointment = await prisma.$transaction(async (tx) => {
-      await assertSlotHasCapacity(tx, body.testId, body.locationId, body.appointmentDate, body.slot);
-      const bookingId = `DC-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${Math.floor(100000 + Math.random() * 900000)}`;
+      // Admins may still book a walk-in into a slot whose time has passed today.
+      await assertSlotHasCapacity(tx, body.testId, body.locationId, body.appointmentDate, body.slot, { allowPast: req.user!.role === "ADMIN" });
+      const bookingId = `DC-${todayStr().replaceAll("-", "")}-${Math.floor(100000 + Math.random() * 900000)}`;
       const created = await tx.appointment.create({
         data: {
           ...body,
@@ -424,7 +444,7 @@ appointmentsRouter.post("/", async (req, res, next) => {
     });
     await activity(req.user!.id, appointment.id, "Appointment Created");
     await audit(req, { appointmentId: appointment.id, action: "APPOINTMENT_CREATED", newValue: appointment });
-    emitRealtime("appointment:changed", appointment);
+    emitRealtime("appointment:changed", { id: appointment.id });
     emitRealtime("slots:changed", { testId: body.testId, locationId: body.locationId, date: body.appointmentDate });
     res.status(201).json(appointment);
   } catch (error) {
@@ -454,15 +474,17 @@ appointmentsRouter.get("/:id", async (req, res) => {
       }
     }
   });
-  if (!appointment) return res.status(404).json({ message: "Not found" });
-  if (req.user?.role !== "ADMIN" && req.user?.role !== "FRONTDESK" && req.user?.role !== "TECHNICIAN") {
-    appointment.totalPrice = null;
-    appointment.advanceReceived = null;
+  if (!appointment || isOutOfScope(req.user!, appointment)) return res.status(404).json({ message: "Not found" });
+  const visible = forViewer(req.user!, appointment);
+  if (hidePhoneFrom(req.user!, appointment)) {
+    // Audit/activity entries embed the full appointment, including the phone number.
+    visible.audits = [];
+    visible.activities = visible.activities.map((a) => ({ ...a, message: a.message.replace(/Phone: "[^"]*" -> "[^"]*"(, )?/g, "") }));
   }
-  res.json(appointment);
+  res.json(visible);
 });
 
-appointmentsRouter.patch("/:id", async (req, res) => {
+appointmentsRouter.patch("/:id", async (req, res, next) => {
   try {
     const body = appointmentBody.partial().extend({
       status: z.enum(["BOOKED", "CONFIRMED", "ON_THE_WAY", "ARRIVED", "SCAN_STARTED", "SCAN_DONE", "REPORT_DELIVERED", "CANCELLED"]).optional()
@@ -479,8 +501,29 @@ appointmentsRouter.patch("/:id", async (req, res) => {
         return res.status(403).json({ message: "Machine Operator accounts can only set scan statuses (Scan Started, Scan Done, Report Delivered)." });
       }
     }
-    const old = await prisma.appointment.findUnique({ where: { id: req.params.id } });
-    if (!old) return res.status(404).json({ message: "Not found" });
+    const user = req.user!;
+    if (READ_ONLY_ROLES.includes(user.role)) {
+      return res.status(403).json({ message: "Your account has read-only access." });
+    }
+    if (user.role === "OPERATOR" && Object.keys(body).some((k) => k !== "status")) {
+      return res.status(403).json({ message: "Machine Operator accounts can only update the scan status." });
+    }
+
+    const old = await prisma.appointment.findUnique({
+      where: { id: req.params.id },
+      include: { location: { select: { showContactToTechnicians: true } } }
+    });
+    if (!old || isOutOfScope(user, old)) return res.status(404).json({ message: "Not found" });
+    if (user.role === "MARKETING" && old.createdById !== user.id) {
+      return res.status(403).json({ message: "You can only update appointments you created." });
+    }
+    if (isOutOfScope(user, { locationId: body.locationId ?? old.locationId, testId: body.testId ?? old.testId })) {
+      return res.status(403).json({ message: "You can only move appointments within your allotted center and tests." });
+    }
+    if (hidePhoneFrom(user, old)) {
+      // The phone was hidden from this technician, so whatever the form sent back is not a real edit.
+      delete body.phoneNumber;
+    }
 
     if (body.referredBy) {
       const match = await prisma.proName.findFirst({
@@ -547,8 +590,12 @@ appointmentsRouter.patch("/:id", async (req, res) => {
       const nextLocation = body.locationId || old.locationId;
       const nextDate = body.appointmentDate || old.appointmentDate;
       const nextSlot = body.slot || old.slot;
-      if (body.status !== "CANCELLED" && (nextTest !== old.testId || String(nextDate) !== String(old.appointmentDate) || nextSlot !== old.slot || nextLocation !== old.locationId)) {
-        await assertSlotHasCapacity(tx, nextTest, nextLocation || "", nextDate, nextSlot, old.id);
+      const rescheduled = nextTest !== old.testId || toDateStr(nextDate) !== toDateStr(old.appointmentDate) || nextSlot !== old.slot || nextLocation !== old.locationId;
+      if (body.status !== "CANCELLED" && rescheduled) {
+        await assertSlotHasCapacity(tx, nextTest, nextLocation || "", nextDate, nextSlot, {
+          ignoreAppointmentId: old.id,
+          allowPast: user.role === "ADMIN"
+        });
       }
       const row = await tx.appointment.update({
         where: { id: old.id },
@@ -629,19 +676,25 @@ appointmentsRouter.patch("/:id", async (req, res) => {
     const message = changes.length > 0 ? `Updated: ${changes.join(", ")}` : "Appointment Updated";
     await activity(req.user!.id, old.id, message);
     await audit(req, { appointmentId: old.id, action: "APPOINTMENT_UPDATED", oldValue: old, newValue: updated });
-    emitRealtime("appointment:changed", updated);
+    emitRealtime("appointment:changed", { id: updated.id });
     emitRealtime("slots:changed", { testId: updated.testId, locationId: updated.locationId, date: updated.appointmentDate });
-    res.json(updated);
+    res.json(forViewer(user, updated));
   } catch (error) {
-    res.status(400).json({ message: error instanceof Error ? error.message : "Update failed" });
+    next(error);
   }
 });
 
-appointmentsRouter.delete("/:id", async (req, res) => {
+appointmentsRouter.delete("/:id", requireRole(Role.ADMIN), async (req, res) => {
   const old = await prisma.appointment.findUnique({ where: { id: req.params.id } });
   if (!old) return res.status(404).json({ message: "Not found" });
-  await prisma.appointment.delete({ where: { id: old.id } });
-  await audit(req, { appointmentId: old.id, action: "APPOINTMENT_DELETED", oldValue: old });
+  await prisma.$transaction(async (tx) => {
+    // Child rows reference the appointment; audit entries are kept (unlinked) as a trail.
+    await tx.activityLog.deleteMany({ where: { appointmentId: old.id } });
+    await tx.statusHistory.deleteMany({ where: { appointmentId: old.id } });
+    await tx.auditLog.updateMany({ where: { appointmentId: old.id }, data: { appointmentId: null } });
+    await tx.appointment.delete({ where: { id: old.id } });
+  });
+  await audit(req, { action: "APPOINTMENT_DELETED", oldValue: old });
   emitRealtime("appointment:changed", { deleted: old.id });
   emitRealtime("slots:changed", { testId: old.testId, locationId: old.locationId, date: old.appointmentDate });
   res.json({ ok: true });

@@ -51,9 +51,22 @@ proNamesRouter.patch("/:id", requireRole(Role.ADMIN), async (req, res, next) => 
 // DELETE /pro-names/:id — delete a pro name (ADMIN ONLY)
 proNamesRouter.delete("/:id", requireRole(Role.ADMIN), async (req, res, next) => {
   try {
-    await prisma.proName.delete({
-      where: { id: req.params.id },
-    });
+    const existing = await prisma.proName.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ message: "PRO name not found" });
+
+    await prisma.proName.delete({ where: { id: req.params.id } });
+
+    // Log deletion so seed script never restores this name on server restart
+    try {
+      await (prisma as any).deletedProName.upsert({
+        where: { name: existing.name },
+        update: { deletedAt: new Date() },
+        create: { name: existing.name }
+      });
+    } catch (_) {
+      // DeletedProName table may not exist yet on older deployments — safe to ignore
+    }
+
     res.json({ message: "PRO name deleted successfully" });
   } catch (err) {
     next(err);

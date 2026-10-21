@@ -5,7 +5,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, Download, Filter, TrendingUp, CheckCircle2, Clock, XCircle, IndianRupee, AlertCircle } from "lucide-react";
 import { Shell } from "../../components/shell";
-import { api, statuses } from "../../lib/api";
+import { DailyTestSummaryModal } from "../../components/DailyTestSummaryModal";
+import { api, statuses, API_URL } from "../../lib/api";
 import { socket } from "../../lib/socket";
 import { getUser } from "../../lib/auth";
 import { AppointmentSuccessPopup } from "../../components/AppointmentSuccessPopup";
@@ -27,10 +28,13 @@ type Appointment = {
   advanceMethod?: string | null;
   remainingMethod?: string | null;
   subTest?: string | null;
+  scanName?: string | null;
+  prescriptionUrl?: string | null;
   test: { name: string; instructions?: string | null };
   createdBy: { name: string };
   location?: { id: string; name: string; mapLink?: string | null; qrCodeUrl?: string | null; address?: string | null; } | null;
   createdAt: string;
+  cityHospital?: string | null;
 };
 
 type DashboardUser = {
@@ -42,6 +46,7 @@ type DashboardUser = {
 };
 
 type Test = { id: string; name: string; active?: boolean; instructions?: string | null };
+type ProName = { id: string; name: string; isCustom?: boolean };
 
 // Use local date to avoid UTC-timezone mismatch where frontdesk bookings don't show
 function todayLocal() {
@@ -151,10 +156,25 @@ export default function DashboardPage() {
   const [selectedTestIds, setSelectedTestIds] = useState<string[]>([]);
   const [testDropdownOpen, setTestDropdownOpen] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [selectedProName, setSelectedProName] = useState("");
+  const [selectedMonth, setSelectedMonth] = useState(""); // format: "YYYY-MM"
   const [halfFilter, setHalfFilter] = useState<"all" | "first" | "second">("all");
   const [showOnlyMyBookings, setShowOnlyMyBookings] = useState(false);
   const [recentPage, setRecentPage] = useState(1);
   const RECENT_PAGE_SIZE = 30;
+
+  // Build month options: current month + last 12 months
+  const monthOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = [];
+    const now = new Date();
+    for (let i = 0; i <= 12; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const label = d.toLocaleString("en-IN", { month: "long", year: "numeric" });
+      opts.push({ value, label });
+    }
+    return opts;
+  }, []);
   
   const [isPopupOpen, setIsPopupOpen] = useState(false);
   const [popupData, setPopupData] = useState<any>(null);
@@ -178,6 +198,9 @@ export default function DashboardPage() {
       qrCodeUrl: appt.location?.qrCodeUrl || null,
       address: appt.location?.address || null,
       proName: appt.referredBy || null,
+      scanName: appt.scanName || null,
+      cityHospital: appt.cityHospital || null,
+      referredDoctor: appt.referredDoctor || null,
     });
     setIsPopupOpen(true);
   };
@@ -221,6 +244,7 @@ export default function DashboardPage() {
     return customDate;
   }, [activeTab, customDate, dateToday, dateTomorrow, dateDayAfter]);
 
+  const [showDailySummaryModal, setShowDailySummaryModal] = useState(false);
   const [sortConfig, setSortConfig] = useState<{ key: string; direction: "asc" | "desc" } | null>(null);
   const handleSort = (key: string) => {
     let direction: "asc" | "desc" = "asc";
@@ -251,25 +275,34 @@ export default function DashboardPage() {
     queryFn: () => api<Test[]>("/tests")
   });
 
+  const { data: proNames = [] } = useQuery<ProName[]>({
+    queryKey: ["pro-names"],
+    queryFn: () => api<ProName[]>("/pro-names"),
+    staleTime: 5 * 60 * 1000,
+  });
+
   const [page, setPage] = useState(1);
   const limit = 150;
 
   useEffect(() => {
     setPage(1);
     setRecentPage(1);
-  }, [q, queryDate, selectedLocationId, selectedTestIds, selectedAgentId, showOnlyMyBookings, activeTab]);
+  }, [q, queryDate, selectedLocationId, selectedTestIds, selectedAgentId, selectedProName, selectedMonth, showOnlyMyBookings, activeTab]);
 
   // Determine if DTPA is among selected tests (to show age column)
   const showAgeColumn = selectedTestIds.length > 0 && tests.filter(t => selectedTestIds.includes(t.id)).some(t => t.name.toUpperCase().includes("DTPA"));
 
   const { data: appointmentsResponse, isLoading } = useQuery({
-    queryKey: ["appointments", queryDate || "all", q, selectedLocationId, selectedTestIds.join(","), selectedAgentId, showOnlyMyBookings, page, activeTab],
+    queryKey: ["appointments", queryDate || "all", q, selectedLocationId, selectedTestIds.join(","), selectedAgentId, selectedProName, selectedMonth, showOnlyMyBookings, page, activeTab],
     queryFn: () => {
       const params = new URLSearchParams({ q, page: String(page), limit: String(limit) });
       if (queryDate) params.set("date", queryDate);
+      // Month filter only when not filtered by a specific date
+      if (!queryDate && selectedMonth) params.set("month", selectedMonth);
       if (selectedLocationId) params.set("locationId", selectedLocationId);
       if (selectedTestIds.length > 0) params.set("testId", selectedTestIds.join(","));
       if (selectedAgentId) params.set("createdById", selectedAgentId);
+      if (selectedProName) params.set("proName", selectedProName);
       if (showOnlyMyBookings && user?.id) params.set("createdById", user.id);
       // Recent mode: sort by updatedAt desc so newest activity (create or edit) comes first
       if (activeTab === "recent") {
@@ -424,9 +457,11 @@ export default function DashboardPage() {
     try {
       const params = new URLSearchParams({ q });
       if (queryDate) params.set("date", queryDate);
+      if (!queryDate && selectedMonth) params.set("month", selectedMonth);
       if (selectedLocationId) params.set("locationId", selectedLocationId);
       if (selectedTestIds.length > 0) params.set("testId", selectedTestIds.join(","));
       if (selectedAgentId) params.set("createdById", selectedAgentId);
+      if (selectedProName) params.set("proName", selectedProName);
       if (showOnlyMyBookings && user?.id) params.set("createdById", user.id);
       
       let fullList = await api<Appointment[]>(`/appointments?${params.toString()}`);
@@ -513,6 +548,14 @@ export default function DashboardPage() {
                 </button>
               )}
             </div>
+
+            <button
+              type="button"
+              onClick={() => setShowDailySummaryModal(true)}
+              className="btn bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm text-xs h-9 px-3 flex items-center gap-1.5 font-semibold whitespace-nowrap"
+            >
+              <span>📋 Test Summary List</span>
+            </button>
 
             <Link className="btn h-9 px-4 text-sm" href="/appointments/new">
               <Plus className="mr-1.5 h-4 w-4" /> New Booking
@@ -620,6 +663,42 @@ export default function DashboardPage() {
             </select>
           )}
 
+          {/* Month filter (hidden for Operator; only useful when no specific date is selected) */}
+          {!isOperator && !queryDate && (
+            <select
+              id="month-filter"
+              className={`input h-9 py-0 min-w-[160px] text-sm ${
+                selectedMonth ? "border-medical-400 bg-medical-50/50" : ""
+              }`}
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+            >
+              <option value="">All Months</option>
+              {monthOptions.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          )}
+
+          {/* PRO Name filter (Hidden for Machine Operators) */}
+          {!isOperator && (
+            <select
+              id="pro-filter"
+              className="input h-9 py-0 min-w-[150px] max-w-[200px] text-sm"
+              value={selectedProName}
+              onChange={(e) => setSelectedProName(e.target.value)}
+            >
+              <option value="">All PROs</option>
+              {proNames.map((p) => (
+                <option key={p.id} value={p.name}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          )}
+
           {/* Booked by Me filter (Frontdesk) */}
           {user?.role === "FRONTDESK" && (
             <label className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300 cursor-pointer select-none bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 h-9 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors">
@@ -660,13 +739,15 @@ export default function DashboardPage() {
         </div>
 
         {/* Active filters hint */}
-        {(selectedTestIds.length > 0 || selectedLocationId || selectedAgentId || showOnlyMyBookings) && (
+        {(selectedTestIds.length > 0 || selectedLocationId || selectedAgentId || selectedProName || selectedMonth || showOnlyMyBookings) && (
           <div className="px-4 py-2 flex items-center gap-2 bg-medical-50/50 dark:bg-medical-950/20 border-b border-medical-100 dark:border-medical-900/30">
             <Filter className="h-3.5 w-3.5 text-medical-500" />
             <span className="text-xs text-medical-700 dark:text-medical-400 font-medium flex flex-wrap gap-1 items-center">
               Filtered by:
               {selectedTestIds.map(id => <span key={id} className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">{tests.find(t => t.id === id)?.name ?? "test"}</span>)}
               {selectedLocationId && <span className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">{locations.find(l => l.id === selectedLocationId)?.name ?? "location"}</span>}
+              {selectedMonth && <span className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">Month: {monthOptions.find(m => m.value === selectedMonth)?.label ?? selectedMonth}</span>}
+              {selectedProName && <span className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">PRO: {selectedProName}</span>}
               {selectedAgentId && <span className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">Agent: {agents.find(u => u.id === selectedAgentId)?.name ?? "agent"}</span>}
               {showOnlyMyBookings && <span className="bg-white/60 dark:bg-slate-800/65 px-1.5 py-0.5 rounded border border-medical-200/50">Booked by Me</span>}
             </span>
@@ -676,6 +757,8 @@ export default function DashboardPage() {
                 setSelectedTestIds([]);
                 setSelectedLocationId("");
                 setSelectedAgentId("");
+                setSelectedProName("");
+                setSelectedMonth("");
                 setShowOnlyMyBookings(false);
               }}
             >
@@ -706,6 +789,7 @@ export default function DashboardPage() {
                         ...(!isOperator ? [{ label: "Phone", key: "phoneNumber" }] : []),
                         ...(showAgeColumn && !isOperator ? [{ label: "Age", key: "" }] : []),
                         { label: "Test", key: "test" },
+                        { label: "Rx", key: "" },
                         { label: "Remarks", key: "notes" },
                         { label: "Location", key: "location" },
                         { label: "Appt Date", key: "appointmentDate" },
@@ -792,9 +876,35 @@ export default function DashboardPage() {
                             </td>
                           )}
                           <td className="px-3 py-2.5">
-                            <span className="text-xs font-medium text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800/80 rounded-full px-2 py-0.5">
-                              {a.test.name}{a.subTest ? ` (${a.subTest})` : ""}
-                            </span>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-xs font-medium text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800/80 rounded-full px-2 py-0.5 w-fit">
+                                {a.test.name}{a.subTest ? ` (${a.subTest})` : ""}
+                              </span>
+                              {a.scanName && (
+                                <span className="text-[10px] text-violet-600 dark:text-violet-400 font-medium pl-1 truncate max-w-[160px]" title={a.scanName}>
+                                  ✦ {a.scanName}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          {/* Prescription Rx one-click */}
+                          <td className="px-3 py-2.5">
+                            {a.prescriptionUrl ? (
+                              <a
+                                href={`${API_URL}${a.prescriptionUrl}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                title={a.scanName ? `Scan: ${a.scanName}` : "View Prescription"}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-violet-100 text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300 dark:hover:bg-violet-800/60 border border-violet-200 dark:border-violet-700 transition-colors"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                </svg>
+                                Rx
+                              </a>
+                            ) : (
+                              <span className="text-slate-300 dark:text-slate-600 text-xs">—</span>
+                            )}
                           </td>
                           <td className="px-3 py-2.5 text-xs text-slate-650 dark:text-slate-400 max-w-[150px] truncate" title={a.notes || ""}>
                             {a.notes || "—"}
@@ -980,6 +1090,13 @@ export default function DashboardPage() {
         isOpen={isPopupOpen} 
         onClose={() => setIsPopupOpen(false)} 
         data={popupData} 
+      />
+
+      <DailyTestSummaryModal
+        isOpen={showDailySummaryModal}
+        onClose={() => setShowDailySummaryModal(false)}
+        defaultDate={queryDate || undefined}
+        defaultLocationId={selectedLocationId || undefined}
       />
     </Shell>
   );

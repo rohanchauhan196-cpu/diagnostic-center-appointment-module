@@ -149,6 +149,9 @@ usersRouter.delete("/:id", async (req, res, next) => {
       });
     }
 
+    // Delete notice read-receipts — these are transient and can be safely removed
+    await prisma.noticeRead.deleteMany({ where: { userId: req.params.id } });
+
     await prisma.user.delete({ where: { id: req.params.id } });
     await audit(req, { action: "USER_DELETED", oldValue: { id: user.id, email: user.email, role: user.role } });
     res.json({ ok: true, message: "User deleted and all bookings safely preserved" });

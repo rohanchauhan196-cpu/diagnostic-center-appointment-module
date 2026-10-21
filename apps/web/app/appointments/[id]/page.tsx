@@ -5,13 +5,33 @@ import { useParams, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Shell } from "../../../components/shell";
 import { ProNameAutocomplete } from "../../../components/ProNameAutocomplete";
-import { api, statuses } from "../../../lib/api";
+import { api, statuses, uploadFile, API_URL } from "../../../lib/api";
 import { socket } from "../../../lib/socket";
 import { getUser } from "../../../lib/auth";
 import { getUsgSubTestOptions } from "../../../lib/usgTests";
 
-type Test = { id: string; name: string; workDays?: string[] };
-type Slot = { label: string; capacity: number; left: number; full: boolean };
+type Test = { id: string; name: string; workDays?: string[]; color?: string; sortOrder?: number; };
+
+function getContrastColor(hexColor?: string | null) {
+  if (!hexColor || !hexColor.startsWith("#")) return "#0f172a";
+  const hex = hexColor.replace("#", "");
+  let r = 0, g = 0, b = 0;
+  if (hex.length === 3) {
+    r = parseInt(hex[0] + hex[0], 16);
+    g = parseInt(hex[1] + hex[1], 16);
+    b = parseInt(hex[2] + hex[2], 16);
+  } else if (hex.length === 6) {
+    r = parseInt(hex.substring(0, 2), 16);
+    g = parseInt(hex.substring(2, 4), 16);
+    b = parseInt(hex.substring(4, 6), 16);
+  } else {
+    return "#0f172a";
+  }
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.55 ? "#0f172a" : "#ffffff";
+}
+// past = slot time has already gone by today (only admins may still move a booking into it)
+type Slot = { label: string; startTime?: string | null; capacity: number; left: number; full: boolean; past?: boolean };
 type Location = { id: string; name: string; active: boolean };
 
 type AppointmentDetail = {
@@ -34,6 +54,8 @@ type AppointmentDetail = {
   subTest?: string | null;
   isPregnant?: boolean | null;
   preferredDoctor?: string | null;
+  scanName?: string | null;
+  prescriptionUrl?: string | null;
   test: { id: string; name: string };
   location?: { id: string; name: string; showContactToTechnicians?: boolean } | null;
   createdBy?: { id: string; name: string; email: string };
@@ -107,6 +129,11 @@ export default function AppointmentDetailPage() {
   const [editSubTest, setEditSubTest] = useState("");
   const [editIsPregnant, setEditIsPregnant] = useState("");
   const [editPreferredDoctor, setEditPreferredDoctor] = useState("");
+  const [editScanName, setEditScanName] = useState("");
+  const [editPrescriptionUrl, setEditPrescriptionUrl] = useState("");
+  const [editPrescriptionFile, setEditPrescriptionFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ["appointment", params.id],
@@ -158,6 +185,9 @@ export default function AppointmentDetailPage() {
       setEditSubTest(data.subTest || "");
       setEditIsPregnant(data.isPregnant != null ? String(data.isPregnant) : "");
       setEditPreferredDoctor(data.preferredDoctor || "");
+      setEditScanName(data.scanName || "");
+      setEditPrescriptionUrl(data.prescriptionUrl || "");
+      setEditPrescriptionFile(null);
     }
   }, [data, isEditing]);
 
@@ -190,6 +220,30 @@ export default function AppointmentDetailPage() {
 
   const editSelectedSubTestName = editSelectedTestOptions.length > 0 ? (editSubTest || editSelectedTestOptions[0]) : "";
   const isTVS = editSelectedSubTestName.toLowerCase().includes("tvs");
+
+  const editIsMRI = activeTestObj ? activeTestObj.name.toLowerCase().includes("mri") : false;
+  const editIsUSGSpecial = activeTestObj
+    ? (activeTestObj.name.toLowerCase().includes("usg") && activeTestObj.name.toLowerCase().includes("special"))
+    : false;
+  const editNeedsPrescription = editIsMRI || editIsUSGSpecial;
+
+  async function handleEditPrescriptionFile(file: File) {
+    setUploadError("");
+    if (file.size > 5 * 1024 * 1024) { setUploadError("Max 5 MB allowed."); return; }
+    const allowed = ["image/jpeg", "image/png", "image/jpg", "application/pdf"];
+    if (!allowed.includes(file.type)) { setUploadError("Only PDF, JPG, or PNG accepted."); return; }
+    setIsUploading(true);
+    setEditPrescriptionFile(file);
+    try {
+      const result = await uploadFile(file);
+      setEditPrescriptionUrl(result.url);
+    } catch (e: any) {
+      setUploadError(e.message || "Upload failed.");
+      setEditPrescriptionFile(null);
+    } finally {
+      setIsUploading(false);
+    }
+  }
 
   const isViewTVS = data?.subTest?.toLowerCase().includes("tvs") || false;
 
@@ -289,6 +343,8 @@ export default function AppointmentDetailPage() {
           subTest: editSelectedTestOptions.length > 0 ? (editSubTest || editSelectedTestOptions[0]) : null,
           isPregnant: isTVS ? (editIsPregnant === "true") : null,
           preferredDoctor: isTVS ? editPreferredDoctor : null,
+          scanName: editNeedsPrescription ? (editScanName.trim() || null) : null,
+          prescriptionUrl: editNeedsPrescription ? (editPrescriptionUrl || null) : null,
         })
       });
       queryClient.invalidateQueries({ queryKey: ["appointment", params.id] });
@@ -384,9 +440,38 @@ export default function AppointmentDetailPage() {
             </div>
             <div>
               <label className="text-xs font-semibold text-slate-500 block mb-1 uppercase">Test Type *</label>
-              <select className="input w-full" value={editTestId} onChange={(e) => { setEditTestId(e.target.value); setEditSubTest(""); }}>
-                {tests.map((t) => <option value={t.id} key={t.id}>{t.name}</option>)}
-              </select>
+              {(() => {
+                const currentTest = tests.find(t => t.id === editTestId);
+                const testBg = currentTest?.color;
+                const testText = testBg ? getContrastColor(testBg) : undefined;
+                return (
+                  <select 
+                    className="input w-full font-bold transition-all duration-150" 
+                    style={{ 
+                      backgroundColor: testBg || undefined,
+                      color: testText || 'inherit',
+                      borderColor: testBg || undefined
+                    }}
+                    value={editTestId} 
+                    onChange={(e) => { setEditTestId(e.target.value); setEditSubTest(""); }}
+                  >
+                    {tests.map((t) => (
+                      <option 
+                        value={t.id} 
+                        key={t.id} 
+                        style={{ 
+                          backgroundColor: t.color || '#ffffff', 
+                          color: t.color ? getContrastColor(t.color) : '#0f172a',
+                          fontWeight: 'bold',
+                          padding: '6px 10px'
+                        }}
+                      >
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                );
+              })()}
             </div>
             {editSelectedTestOptions.length > 0 && (
               <div>
@@ -400,7 +485,7 @@ export default function AppointmentDetailPage() {
             )}
             <div>
               <label className="text-xs font-semibold text-slate-500 block mb-1 uppercase">Date *</label>
-              <input className="input w-full" type="date" value={editDate} min={new Date().toISOString().slice(0, 10)} onChange={(e) => setEditDate(e.target.value)} onClick={(e) => { try { e.currentTarget.showPicker?.(); } catch (err) {} }} required />
+              <input className="input w-full" type="date" value={editDate} min={new Date().toLocaleDateString("en-CA")} onChange={(e) => setEditDate(e.target.value)} onClick={(e) => { try { e.currentTarget.showPicker?.(); } catch (err) {} }} required />
             </div>
             <div>
               <label className="text-xs font-semibold text-slate-500 block mb-1 uppercase">Status</label>
@@ -415,17 +500,18 @@ export default function AppointmentDetailPage() {
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {slots.map((slot) => {
                 const isSelected = editSlot === slot.label;
+                const blocked = !isSelected && (slot.full || (slot.past && !isAdmin));
                 return (
                   <label
                     className={`rounded-md border p-3 text-sm flex items-center cursor-pointer ${
-                      slot.full && !isSelected ? "border-slate-200 bg-slate-100 text-slate-400"
+                      blocked ? "border-slate-200 bg-slate-100 text-slate-400"
                       : isSelected ? "border-medical-500 bg-medical-50 text-medical-800 font-medium"
                       : "border-medical-100 bg-medical-50/50 text-medical-700 hover:bg-medical-50"
                     }`}
                     key={slot.label}
                   >
-                    <input className="mr-2" name="slot" type="radio" value={slot.label} checked={isSelected} onChange={(e) => setEditSlot(e.target.value)} disabled={slot.full && !isSelected} required />
-                    {slot.label} ({slot.full && !isSelected ? "FULL" : isSelected ? "Selected" : `${slot.left} left`})
+                    <input className="mr-2" name="slot" type="radio" value={slot.label} checked={isSelected} onChange={(e) => setEditSlot(e.target.value)} disabled={blocked} required />
+                    {slot.label} ({isSelected ? "Selected" : slot.full ? "FULL" : slot.past ? (isAdmin ? `time passed · ${slot.left} left` : "Time passed") : `${slot.left} left`})
                   </label>
                 );
               })}
@@ -571,6 +657,68 @@ export default function AppointmentDetailPage() {
             </div>
           )}
 
+          {/* Prescription / Scan Name — MRI & USG Special Study */}
+          {editNeedsPrescription && (
+            <section className="rounded-xl border-2 border-violet-200 bg-violet-50/40 dark:bg-violet-950/20 dark:border-violet-800/50 p-4 space-y-3">
+              <div className="flex items-center gap-2 pb-1 border-b border-violet-200 dark:border-violet-800/40">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-violet-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-violet-700 dark:text-violet-300">
+                  {activeTestObj?.name} — Prescription (Optional)
+                </h3>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-violet-700 dark:text-violet-300 uppercase mb-1">Scan Name / Procedure</label>
+                <input
+                  className="input w-full"
+                  placeholder="e.g. MRI Brain with Contrast, MRI Spine L-S..."
+                  value={editScanName}
+                  onChange={(e) => setEditScanName(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-violet-700 dark:text-violet-300 uppercase mb-1">
+                  Prescription
+                  <span className="ml-2 text-[10px] font-normal text-slate-400 normal-case">(PDF, JPG, PNG · max 5 MB)</span>
+                </label>
+                {!editPrescriptionUrl ? (
+                  <label className="flex flex-col items-center justify-center gap-2 w-full min-h-[80px] border-2 border-dashed border-violet-300 hover:border-violet-500 rounded-xl cursor-pointer bg-violet-50/30 hover:bg-violet-50/60 dark:bg-violet-950/20 dark:hover:bg-violet-900/20 transition-all">
+                    {isUploading ? (
+                      <div className="flex flex-col items-center gap-1">
+                        <span className="h-5 w-5 rounded-full border-2 border-violet-500 border-t-transparent animate-spin" />
+                        <span className="text-xs text-violet-600">Uploading...</span>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-1 pointer-events-none">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                        </svg>
+                        <span className="text-xs font-semibold text-violet-600">Click to upload prescription</span>
+                      </div>
+                    )}
+                    <input type="file" accept=".pdf,.jpg,.jpeg,.png" className="sr-only" disabled={isUploading}
+                      onChange={(e) => { const f = e.target.files?.[0]; if (f) handleEditPrescriptionFile(f); }} />
+                  </label>
+                ) : (
+                  <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50/60 dark:bg-emerald-950/20 dark:border-emerald-800/50 px-4 py-3">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 truncate">
+                        {editPrescriptionFile?.name || "Prescription uploaded"}
+                      </p>
+                      <a href={`${API_URL}${editPrescriptionUrl}`} target="_blank" rel="noreferrer"
+                        className="text-[10px] text-violet-600 hover:underline">View current file ↗</a>
+                    </div>
+                    <button type="button"
+                      onClick={() => { setEditPrescriptionUrl(""); setEditPrescriptionFile(null); setUploadError(""); }}
+                      className="text-xs text-slate-400 hover:text-red-500 transition-colors font-medium shrink-0">✕ Remove</button>
+                  </div>
+                )}
+                {uploadError && <p className="mt-1 text-xs text-red-600">{uploadError}</p>}
+              </div>
+            </section>
+          )}
+
           {error && <p className="rounded-md bg-red-50 border border-red-200 p-3 text-sm text-red-700">{error}</p>}
 
           <div className="flex gap-2 justify-end pt-2 border-t">
@@ -603,6 +751,25 @@ export default function AppointmentDetailPage() {
             <div className="card space-y-2">
               <h2 className="font-semibold text-slate-800 dark:text-slate-200">Appointment Details</h2>
               <p className="text-sm"><span className="text-slate-500">Test:</span> <span className="font-semibold text-medical-600">{data.test.name}{data.subTest ? ` (${data.subTest})` : ""}</span></p>
+              {data.scanName && (
+                <p className="text-sm"><span className="text-slate-500">Scan Name:</span> <span className="font-medium text-violet-700 dark:text-violet-300">{data.scanName}</span></p>
+              )}
+              {data.prescriptionUrl && (
+                <p className="text-sm flex items-center gap-2">
+                  <span className="text-slate-500">Prescription:</span>
+                  <a
+                    href={`${API_URL}${data.prescriptionUrl}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-violet-100 text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300 border border-violet-200 dark:border-violet-700 transition-colors"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    View Rx
+                  </a>
+                </p>
+              )}
               <p className="text-sm"><span className="text-slate-500">Location:</span> <span className="font-semibold text-medical-600">{data.location?.name || "None"}</span></p>
               <p className="text-sm"><span className="text-slate-500">Date:</span> {data.appointmentDate.slice(0, 10)}</p>
               <p className="text-sm"><span className="text-slate-500">Slot:</span> {data.slot}</p>

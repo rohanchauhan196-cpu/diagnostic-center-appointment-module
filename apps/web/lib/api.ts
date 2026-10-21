@@ -31,3 +31,17 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const statuses = ["BOOKED", "CONFIRMED", "ON_THE_WAY", "ARRIVED", "SCAN_STARTED", "SCAN_DONE", "REPORT_DELIVERED", "CANCELLED"];
+
+export async function uploadFile(file: File): Promise<{ url: string }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(`${API_URL}/upload`, {
+    method: "POST",
+    headers: {
+      ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {})
+    },
+    body: formData
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).message || "Upload failed");
+  return res.json();
+}

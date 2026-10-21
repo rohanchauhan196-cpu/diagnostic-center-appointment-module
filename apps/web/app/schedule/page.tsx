@@ -5,9 +5,11 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Clock, FlaskConical, MapPin, Phone, User, Plus } from "lucide-react";
 import Link from "next/link";
 import { Shell } from "../../components/shell";
-import { api, statuses } from "../../lib/api";
+import { DailyTestSummaryModal } from "../../components/DailyTestSummaryModal";
+import { api, statuses, API_URL } from "../../lib/api";
 import { getUser } from "../../lib/auth";
 import { socket } from "../../lib/socket";
+import { AppointmentSuccessPopup } from "../../components/AppointmentSuccessPopup";
 
 type Appointment = {
   id: string;
@@ -17,13 +19,17 @@ type Appointment = {
   appointmentDate: string;
   slot: string;
   referredBy?: string;
+  referredDoctor?: string | null;
+  cityHospital?: string | null;
   notes?: string;
   status: string;
   totalPrice?: number | null;
   advanceReceived?: number | null;
   subTest?: string | null;
-  test: { id: string; name: string };
-  location?: { id: string; name: string; showContactToTechnicians?: boolean } | null;
+  scanName?: string | null;
+  prescriptionUrl?: string | null;
+  test: { id: string; name: string; instructions?: string | null };
+  location?: { id: string; name: string; showContactToTechnicians?: boolean; qrCodeUrl?: string | null; mapLink?: string | null; address?: string | null } | null;
   createdBy: { name: string };
   createdAt: string;
 };
@@ -71,6 +77,57 @@ export default function SchedulePage() {
   const [recentPage, setRecentPage] = useState(1);
   const RECENT_PAGE_SIZE = 30;
 
+  const [showDailySummaryModal, setShowDailySummaryModal] = useState(false);
+  const [isPopupOpen, setIsPopupOpen] = useState(false);
+  const [popupData, setPopupData] = useState<{
+    patientName: string; phoneNumber: string; appointmentDate: string;
+    slotTime: string; testName: string; totalPrice: number; locationName: string;
+    bookedBy: string; instructions: string | null; mapLink: string | null;
+    qrCodeUrl: string | null; address: string | null; proName?: string | null; scanName?: string | null;
+    cityHospital?: string | null; referredDoctor?: string | null;
+  } | null>(null);
+
+  const openMessagePopup = (appt: Appointment) => {
+    const d = new Date(appt.appointmentDate);
+    const formattedDate = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+    const matchingTest = tests.find(t => t.name.toLowerCase() === appt.test.name.toLowerCase());
+    setPopupData({
+      patientName: appt.patientName,
+      phoneNumber: appt.phoneNumber || "",
+      appointmentDate: formattedDate,
+      slotTime: appt.slot,
+      testName: appt.test.name,
+      totalPrice: appt.totalPrice || 0,
+      locationName: appt.location?.name || "",
+      bookedBy: appt.createdBy?.name || "Unknown Agent",
+      instructions: matchingTest?.instructions || appt.test.instructions || null,
+      mapLink: appt.location?.mapLink || null,
+      qrCodeUrl: appt.location?.qrCodeUrl || null,
+      address: appt.location?.address || null,
+      proName: appt.referredBy || null,
+      scanName: appt.scanName || null,
+      cityHospital: appt.cityHospital || null,
+      referredDoctor: appt.referredDoctor || null,
+    });
+    setIsPopupOpen(true);
+  };
+
+  const copyQrCode = async (appt: Appointment) => {
+    if (!appt.location?.qrCodeUrl) { alert("No QR Code available for this location."); return; }
+    try {
+      const response = await fetch(appt.location.qrCodeUrl);
+      const blob = await response.blob();
+      if (navigator.clipboard && navigator.clipboard.write) {
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        alert("QR Code copied to clipboard!");
+      } else {
+        alert("Clipboard API not supported in this browser.");
+      }
+    } catch (err) {
+      alert("Failed to copy QR Code.");
+    }
+  };
+
   const dateToday = todayLocal();
   const dateTomorrow = tomorrowLocal();
   const dateDayAfter = dayAfterTomorrowLocal();
@@ -80,7 +137,7 @@ export default function SchedulePage() {
     if (activeTab === "tomorrow") return dateTomorrow;
     if (activeTab === "dayAfter") return dateDayAfter;
     if (activeTab === "all") return "";
-    if (activeTab === "recent") return ""; // fetch all, sort client-side
+    if (activeTab === "recent") return ""; // fetch all, sort client-side`
     return customDate;
   }, [activeTab, customDate, dateToday, dateTomorrow, dateDayAfter]);
 
@@ -91,7 +148,7 @@ export default function SchedulePage() {
 
   const { data: tests = [] } = useQuery({
     queryKey: ["tests"],
-    queryFn: () => api<{ id: string; name: string; active: boolean }[]>("/tests")
+    queryFn: () => api<{ id: string; name: string; active: boolean; instructions?: string | null }[]>("/tests")
   });
   const filteredTestsForUser = useMemo(() => {
     if (user?.role === "TECHNICIAN" && user?.testTypes && user.testTypes.length > 0) {
@@ -206,6 +263,7 @@ export default function SchedulePage() {
   }, [filteredData]);
 
   return (
+    <>
     <Shell>
       {/* Header */}
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
@@ -299,6 +357,14 @@ export default function SchedulePage() {
                 </button>
               )}
             </div>
+
+            <button
+              type="button"
+              onClick={() => setShowDailySummaryModal(true)}
+              className="btn bg-gradient-to-r from-indigo-600 to-medical-600 hover:from-indigo-500 hover:to-medical-500 text-white shadow-sm text-xs h-9 px-3 flex items-center gap-1.5 font-semibold whitespace-nowrap"
+            >
+              <span>📋 Copy Test List</span>
+            </button>
           </div>
         )}
         <div className="flex flex-wrap items-center gap-3">
@@ -338,7 +404,7 @@ export default function SchedulePage() {
             onChange={(e) => setSelectedLocation(e.target.value)}
           >
             {user?.role === "TECHNICIAN" && user?.locationId ? (
-              locations.filter(l => l.id === user.locationId).map(l => (
+              locations.filter(l => l.id === user?.locationId).map(l => (
                 <option key={l.id} value={l.id}>{l.name}</option>
               ))
             ) : (
@@ -501,12 +567,17 @@ export default function SchedulePage() {
                       )}
                     </div>
 
-                    {/* Test & location */}
+                    {/* Test & location — recent cards */}
                     <div className="flex flex-col gap-1 min-w-[150px]">
                       <div className="flex items-center gap-1.5 text-sm text-purple-700 dark:text-purple-300 font-semibold">
                         <FlaskConical className="h-3.5 w-3.5 flex-shrink-0" />
                         {appt.test.name}{appt.subTest ? ` (${appt.subTest})` : ""}
                       </div>
+                      {appt.scanName && (
+                        <div className="text-[10px] text-violet-600 dark:text-violet-400 font-medium pl-5 truncate max-w-[200px]" title={appt.scanName}>
+                          ✦ {appt.scanName}
+                        </div>
+                      )}
                       {appt.location && (
                         <div className="flex items-center gap-1.5 text-xs text-slate-500">
                           <MapPin className="h-3 w-3 flex-shrink-0" />
@@ -559,9 +630,39 @@ export default function SchedulePage() {
                           </option>
                         ))}
                       </select>
-                      <Link className="text-xs text-medical-700 dark:text-medical-400 font-semibold hover:underline" href={`/appointments/${appt.id}`}>
-                        View/Edit Details &rarr;
-                      </Link>
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        <button
+                          className="text-[10px] font-semibold text-white bg-medical-600 hover:bg-medical-700 px-2 py-1 rounded shadow-sm transition-colors uppercase tracking-wider"
+                          onClick={() => openMessagePopup(appt)}
+                        >
+                          Message
+                        </button>
+                        {appt.location?.qrCodeUrl && (
+                          <button
+                            className="text-[10px] font-semibold text-medical-700 bg-medical-100 hover:bg-medical-200 border border-medical-200 px-2 py-1 rounded shadow-sm transition-colors uppercase tracking-wider"
+                            onClick={() => copyQrCode(appt)}
+                          >
+                            QR Code
+                          </button>
+                        )}
+                        {appt.prescriptionUrl && (
+                          <a
+                            href={`${API_URL}${appt.prescriptionUrl}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={appt.scanName ? `Scan: ${appt.scanName}` : "View Prescription"}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-violet-100 text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300 dark:hover:bg-violet-800/60 border border-violet-200 dark:border-violet-700 transition-colors"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            Rx
+                          </a>
+                        )}
+                        <Link className="text-xs text-medical-700 dark:text-medical-400 font-semibold hover:underline" href={`/appointments/${appt.id}`}>
+                          View/Edit Details &rarr;
+                        </Link>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -639,12 +740,17 @@ export default function SchedulePage() {
                       </div>
                     </div>
 
-                    {/* Test & Location */}
+                    {/* Test & Location — slot-grouped cards */}
                     <div className="flex flex-col gap-1 min-w-[160px]">
                       <div className="flex items-center gap-1.5 text-sm text-purple-700 dark:text-purple-300 font-semibold">
                         <FlaskConical className="h-3.5 w-3.5 flex-shrink-0" />
                         {appt.test.name}{appt.subTest ? ` (${appt.subTest})` : ""}
                       </div>
+                      {appt.scanName && (
+                        <div className="text-[10px] text-violet-600 dark:text-violet-400 font-medium pl-5 truncate max-w-[200px]" title={appt.scanName}>
+                          ✦ {appt.scanName}
+                        </div>
+                      )}
                       {appt.location && (
                         <div className="flex items-center gap-1.5 text-xs text-slate-500">
                           <MapPin className="h-3 w-3 flex-shrink-0" />
@@ -717,9 +823,39 @@ export default function SchedulePage() {
                           </option>
                         ))}
                       </select>
-                      <Link className="text-xs text-medical-700 dark:text-medical-400 font-semibold hover:underline" href={`/appointments/${appt.id}`}>
-                        View/Edit Details &rarr;
-                      </Link>
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        <button
+                          className="text-[10px] font-semibold text-white bg-medical-600 hover:bg-medical-700 px-2 py-1 rounded shadow-sm transition-colors uppercase tracking-wider"
+                          onClick={() => openMessagePopup(appt)}
+                        >
+                          Message
+                        </button>
+                        {appt.location?.qrCodeUrl && (
+                          <button
+                            className="text-[10px] font-semibold text-medical-700 bg-medical-100 hover:bg-medical-200 border border-medical-200 px-2 py-1 rounded shadow-sm transition-colors uppercase tracking-wider"
+                            onClick={() => copyQrCode(appt)}
+                          >
+                            QR Code
+                          </button>
+                        )}
+                        {appt.prescriptionUrl && (
+                          <a
+                            href={`${API_URL}${appt.prescriptionUrl}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={appt.scanName ? `Scan: ${appt.scanName}` : "View Prescription"}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-violet-100 text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300 dark:hover:bg-violet-800/60 border border-violet-200 dark:border-violet-700 transition-colors"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            Rx
+                          </a>
+                        )}
+                        <Link className="text-xs text-medical-700 dark:text-medical-400 font-semibold hover:underline" href={`/appointments/${appt.id}`}>
+                          View/Edit Details &rarr;
+                        </Link>
+                      </div>
                     </div>
                   </div>
                 );
@@ -766,5 +902,17 @@ export default function SchedulePage() {
         </details>
       )}
     </Shell>
+    <AppointmentSuccessPopup
+      isOpen={isPopupOpen}
+      onClose={() => setIsPopupOpen(false)}
+      data={popupData}
+    />
+    <DailyTestSummaryModal
+      isOpen={showDailySummaryModal}
+      onClose={() => setShowDailySummaryModal(false)}
+      defaultDate={queryDate || undefined}
+      defaultLocationId={selectedLocation || undefined}
+    />
+    </>
   );
 }

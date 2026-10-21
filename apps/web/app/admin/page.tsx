@@ -1,21 +1,73 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useState, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Shell } from "../../components/shell";
+import { DailyTestSummaryModal } from "../../components/DailyTestSummaryModal";
 import { api, API_URL } from "../../lib/api";
 import { getToken, getUser } from "../../lib/auth";
+import { minutesToTime, parseTimeFromLabel, slotLabel, timeToMinutes } from "../../lib/slotTime";
 
 const DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+type EditableSlot = { label: string; startTime?: string | null; capacity: number; sortOrder: number; active?: boolean; dayOfWeek?: string };
+
+type AgentStats = {
+  agentId: string;
+  agentName: string;
+  role: string;
+  count: number;
+  revenue?: number;
+  advance?: number;
+  pending?: number;
+};
 
 type Analytics = {
   kpis: { total: number; today: number; monthly: number; completed: number; cancelled: number };
   byReferral: { referredBy: string | null; _count: number }[];
-  byAgent?: { agentId: string; agentName: string; role: string; count: number }[];
+  byAgent?: AgentStats[];
   byMarketing?: { agentId: string; monthly: number }[];
 };
-type Test = { id: string; name: string; active: boolean; workDays?: string[]; locationWorkDays?: string[] | null; slots: { label: string; capacity: number; sortOrder?: number; active?: boolean; dayOfWeek?: string }[] };
+const PRESET_TEST_COLORS = [
+  { name: "Pink", hex: "#ec4899" },
+  { name: "Rose", hex: "#f43f5e" },
+  { name: "Red", hex: "#ef4444" },
+  { name: "Orange", hex: "#f97316" },
+  { name: "Amber", hex: "#f59e0b" },
+  { name: "Yellow", hex: "#eab308" },
+  { name: "Lime", hex: "#84cc16" },
+  { name: "Emerald", hex: "#10b981" },
+  { name: "Teal", hex: "#14b8a6" },
+  { name: "Cyan", hex: "#06b6d4" },
+  { name: "Sky", hex: "#0ea5e9" },
+  { name: "Blue", hex: "#3b82f6" },
+  { name: "Indigo", hex: "#6366f1" },
+  { name: "Purple", hex: "#a855f7" },
+  { name: "Fuchsia", hex: "#d946ef" },
+  { name: "Slate", hex: "#64748b" },
+];
+
+function getContrastColor(hexColor?: string | null) {
+  if (!hexColor || !hexColor.startsWith("#")) return "#0f172a";
+  const hex = hexColor.replace("#", "");
+  let r = 0, g = 0, b = 0;
+  if (hex.length === 3) {
+    r = parseInt(hex[0] + hex[0], 16);
+    g = parseInt(hex[1] + hex[1], 16);
+    b = parseInt(hex[2] + hex[2], 16);
+  } else if (hex.length === 6) {
+    r = parseInt(hex.substring(0, 2), 16);
+    g = parseInt(hex.substring(2, 4), 16);
+    b = parseInt(hex.substring(4, 6), 16);
+  } else {
+    return "#0f172a";
+  }
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.55 ? "#0f172a" : "#ffffff";
+}
+
+type Test = { id: string; name: string; active: boolean; workDays?: string[]; locationWorkDays?: string[] | null; slots: { label: string; startTime?: string | null; capacity: number; sortOrder?: number; active?: boolean; dayOfWeek?: string }[]; color?: string; sortOrder?: number; };
 type AdminUser = {
   id: string;
   name: string;
@@ -80,6 +132,7 @@ export default function AdminPage() {
   const [editingLocationAddress, setEditingLocationAddress] = useState("");
 
   const [testName, setTestName] = useState("");
+  const [testColor, setTestColor] = useState("#3b82f6");
   const [testInstructions, setTestInstructions] = useState("");
   const [newTestDays, setNewTestDays] = useState<string[]>(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]);
   const [testMessage, setTestMessage] = useState("");
@@ -87,21 +140,33 @@ export default function AdminPage() {
 
   const [editingTestId, setEditingTestId] = useState<string | null>(null);
   const [editingTestName, setEditingTestName] = useState("");
+  const [editingTestColor, setEditingTestColor] = useState("#3b82f6");
   const [editingTestInstructions, setEditingTestInstructions] = useState("");
   const [editingTestDays, setEditingTestDays] = useState<string[]>([]);
 
   const [selectedLocationId, setSelectedLocationId] = useState("");
   const [selectedSlotTestId, setSelectedSlotTestId] = useState("");
-  const [editingSlots, setEditingSlots] = useState<{ label: string; capacity: number; sortOrder: number; active?: boolean; dayOfWeek?: string }[]>([]);
+  const [editingSlots, setEditingSlots] = useState<EditableSlot[]>([]);
+  const [draggedSlotIndex, setDraggedSlotIndex] = useState<number | null>(null);
+  const [draggedTestIndex, setDraggedTestIndex] = useState<number | null>(null);
   const [selectedSlotDay, setSelectedSlotDay] = useState("All");
   const [editingLocationWorkDays, setEditingLocationWorkDays] = useState<string[]>([]);
   const [slotMessage, setSlotMessage] = useState("");
   const [slotError, setSlotError] = useState("");
+  // Extra days that receive the same slot set when saving
+  const [applyToDays, setApplyToDays] = useState<string[]>([]);
+  // Slot generator: builds evenly spaced slots with an optional label suffix
+  const [genFrom, setGenFrom] = useState("09:00");
+  const [genTo, setGenTo] = useState("13:00");
+  const [genEvery, setGenEvery] = useState(30);
+  const [genCapacity, setGenCapacity] = useState(5);
+  const [genSuffix, setGenSuffix] = useState("");
 
   const [csvStartDate, setCsvStartDate] = useState("");
   const [csvEndDate, setCsvEndDate] = useState("");
   const [csvLocationId, setCsvLocationId] = useState("");
   const [csvTestId, setCsvTestId] = useState("");
+  const [csvProName, setCsvProName] = useState("");
 
   const [proNameInput, setProNameInput] = useState("");
   const [proMessage, setProMessage] = useState("");
@@ -109,13 +174,27 @@ export default function AdminPage() {
   const [editingProId, setEditingProId] = useState<string | null>(null);
   const [editingProName, setEditingProName] = useState("");
   const [proSearchQuery, setProSearchQuery] = useState("");
+  const [showDailySummaryModal, setShowDailySummaryModal] = useState(false);
+
+  // ─── Date Block state ────────────────────────────────────────────────────────
+  const [blockTestId, setBlockTestId] = useState("");
+  const [blockLocationId, setBlockLocationId] = useState(""); // "" = all centers
+  const [blockDate, setBlockDate] = useState("");
+  const [blockReason, setBlockReason] = useState("");
+  const [blockMessage, setBlockMessage] = useState("");
+  const [blockError, setBlockError] = useState("");
+  const [blockLoading, setBlockLoading] = useState(false);
+
+  // System Admin accounts management
+  const [adminMessage, setAdminMessage] = useState("");
+  const [adminError, setAdminError] = useState("");
 
   // Chart month filter — defaults to current month
   const now = new Date();
   const [chartMonth, setChartMonth] = useState(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`);
 
   const { data } = useQuery({
-    queryKey: ["analytics", chartMonth, csvLocationId, csvTestId, csvStartDate, csvEndDate],
+    queryKey: ["analytics", chartMonth, csvLocationId, csvTestId, csvProName, csvStartDate, csvEndDate],
     queryFn: () => {
       const params = new URLSearchParams();
       // Custom date range takes priority over month picker
@@ -129,6 +208,7 @@ export default function AdminPage() {
       }
       if (csvLocationId) params.set("locationId", csvLocationId);
       if (csvTestId)     params.set("testId",     csvTestId);
+      if (csvProName)    params.set("proName",    csvProName);
       return api<Analytics>(`/admin/analytics?${params.toString()}`);
     }
   });
@@ -158,17 +238,52 @@ export default function AdminPage() {
 
   const { data: users = [], refetch: refetchUsers } = useQuery({ queryKey: ["users"], queryFn: () => api<AdminUser[]>("/users") });
 
+  const { data: dateBlocks = [], refetch: refetchDateBlocks } = useQuery<{
+    id: string; date: string; reason: string | null;
+    location: { id: string; name: string } | null;
+    createdBy: { id: string; name: string };
+    testId: string;
+  }[]>({
+    queryKey: ["date-blocks", blockTestId],
+    queryFn: () => blockTestId ? api(`/tests/${blockTestId}/date-blocks`) : Promise.resolve([]),
+    enabled: !!blockTestId
+  });
+
+  const proOptions = useMemo(() => {
+    const set = new Set<string>();
+    const list: string[] = [];
+    proList.forEach((p) => {
+      const name = p.name?.trim();
+      if (name && !set.has(name)) {
+        set.add(name);
+        list.push(name);
+      }
+    });
+    (data?.byReferral || []).forEach((r) => {
+      const name = r.referredBy?.trim();
+      if (name && !set.has(name)) {
+        set.add(name);
+        list.push(name);
+      }
+    });
+    if (csvProName && !set.has(csvProName)) {
+      list.push(csvProName);
+    }
+    return list.sort((a, b) => a.localeCompare(b));
+  }, [proList, data?.byReferral, csvProName]);
+
   // Add a user hook to copy current slots when test or location changes
   // Add a user hook to copy current slots when test or location changes
   const handleSelectTest = (testId: string, day = selectedSlotDay) => {
     setSelectedSlotTestId(testId);
+    setApplyToDays([]);
     const test = tests.find((t) => t.id === testId);
     if (test) {
       const hasCustomDaySlots = test.slots.some(s => (s.dayOfWeek ?? "All") === day);
       const daySlots = (hasCustomDaySlots || day === "All")
         ? test.slots.filter(s => (s.dayOfWeek ?? "All") === day)
         : test.slots.filter(s => (s.dayOfWeek ?? "All") === "All");
-      setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
+      setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, startTime: s.startTime ?? null, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
       // Load per-center workDays if available, else fall back to global workDays
       setEditingLocationWorkDays(
         test.locationWorkDays ?? test.workDays ?? DAYS_OF_WEEK
@@ -183,6 +298,7 @@ export default function AdminPage() {
 
   const handleSelectSlotDay = (day: string) => {
     setSelectedSlotDay(day);
+    setApplyToDays([]);
     if (selectedSlotTestId) {
       const test = tests.find((t) => t.id === selectedSlotTestId);
       if (test) {
@@ -190,7 +306,7 @@ export default function AdminPage() {
         const daySlots = (hasCustomDaySlots || day === "All")
           ? test.slots.filter(s => (s.dayOfWeek ?? "All") === day)
           : test.slots.filter(s => (s.dayOfWeek ?? "All") === "All");
-        setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
+        setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, startTime: s.startTime ?? null, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
       }
     } else {
       setEditingSlots([]);
@@ -207,7 +323,7 @@ export default function AdminPage() {
       if (daySlots.length === 0 && day !== "All") {
         daySlots = test.slots.filter(s => (s.dayOfWeek ?? "All") === "All");
       }
-      setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
+      setEditingSlots(daySlots.map((s, idx) => ({ label: s.label, startTime: s.startTime ?? null, capacity: s.capacity, sortOrder: idx + 1, active: s.active ?? true, dayOfWeek: s.dayOfWeek ?? "All" })));
       setEditingLocationWorkDays(
         test.locationWorkDays ?? test.workDays ?? DAYS_OF_WEEK
       );
@@ -263,6 +379,56 @@ export default function AdminPage() {
       refetchUsers();
     } catch (error) {
       setUserError(error instanceof Error ? error.message : "Could not create analytics user");
+    }
+  }
+
+  async function createAdminUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAdminMessage("");
+    setAdminError("");
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    try {
+      await api("/users", {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.get("adminName"),
+          email: form.get("adminEmail"),
+          password: form.get("adminPassword"),
+          role: "ADMIN"
+        })
+      });
+      formElement.reset();
+      setAdminMessage("System Admin account created. They now have full admin access.");
+      refetchUsers();
+    } catch (error) {
+      setAdminError(error instanceof Error ? error.message : "Could not create admin account");
+    }
+  }
+
+  async function deleteAdmin(id: string, email: string) {
+    if (!confirm(`Delete admin account "${email}"? Their bookings will be preserved.`)) return;
+    setAdminMessage("");
+    setAdminError("");
+    try {
+      await api(`/users/${id}`, { method: "DELETE" });
+      setAdminMessage("Admin account deleted. All related data was preserved.");
+      refetchUsers();
+    } catch (error) {
+      setAdminError(error instanceof Error ? error.message : "Could not delete admin account");
+    }
+  }
+
+  async function resetAdminPassword(id: string) {
+    const password = window.prompt("Enter new password for this admin (minimum 8 characters):");
+    if (!password) return;
+    if (password.length < 8) { setAdminError("Password must be at least 8 characters."); return; }
+    setAdminMessage(""); setAdminError("");
+    try {
+      await api(`/users/${id}`, { method: "PATCH", body: JSON.stringify({ password }) });
+      setAdminMessage("Admin password reset successfully.");
+    } catch (error) {
+      setAdminError(error instanceof Error ? error.message : "Could not reset password");
     }
   }
 
@@ -553,11 +719,13 @@ export default function AdminPage() {
         method: "POST", 
         body: JSON.stringify({ 
           name: testName, 
+          color: testColor,
           workDays: newTestDays,
           instructions: testInstructions
         }) 
       });
       setTestName("");
+      setTestColor("#3b82f6");
       setTestInstructions("");
       setNewTestDays(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]);
       setTestMessage(`Test "${testName}" created.`);
@@ -570,6 +738,7 @@ export default function AdminPage() {
   const startEditingTest = (test: Test & { instructions?: string | null }) => {
     setEditingTestId(test.id);
     setEditingTestName(test.name);
+    setEditingTestColor(test.color || "#3b82f6");
     setEditingTestInstructions(test.instructions || "");
     setEditingTestDays(test.workDays || ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]);
   };
@@ -581,6 +750,7 @@ export default function AdminPage() {
         method: "PATCH",
         body: JSON.stringify({ 
           name: editingTestName, 
+          color: editingTestColor,
           workDays: editingTestDays,
           instructions: editingTestInstructions
         })
@@ -613,6 +783,26 @@ export default function AdminPage() {
       refetchTests();
     } catch (error) {
       setTestError(error instanceof Error ? error.message : "Could not delete test");
+    }
+  }
+
+  async function handleMoveTest(fromIndex: number, toIndex: number) {
+    if (fromIndex < 0 || toIndex < 0 || fromIndex >= tests.length || toIndex >= tests.length) return;
+    const reordered = [...tests];
+    const [moved] = reordered.splice(fromIndex, 1);
+    reordered.splice(toIndex, 0, moved);
+
+    queryClient.setQueryData(["tests-admin", selectedLocationId], reordered);
+    try {
+      await api("/tests/reorder", {
+        method: "POST",
+        body: JSON.stringify({ orderedIds: reordered.map(t => t.id) })
+      });
+      refetchTests();
+      queryClient.invalidateQueries({ queryKey: ["tests"] });
+    } catch (error) {
+      setTestError("Failed to save reordered tests.");
+      refetchTests();
     }
   }
 
@@ -665,19 +855,93 @@ export default function AdminPage() {
     }
   }
 
+  // ─── Date Block handlers ────────────────────────────────────────────────────
+  async function createDateBlock() {
+    setBlockMessage(""); setBlockError("");
+    if (!blockTestId) { setBlockError("Please select a test."); return; }
+    if (!blockDate) { setBlockError("Please select a date."); return; }
+    setBlockLoading(true);
+    try {
+      await api(`/tests/${blockTestId}/date-blocks`, {
+        method: "POST",
+        body: JSON.stringify({
+          date: blockDate,
+          locationId: blockLocationId || null,
+          reason: blockReason.trim() || null
+        })
+      });
+      const locName = blockLocationId ? locations.find(l => l.id === blockLocationId)?.name : "All Centers";
+      const testName = tests.find(t => t.id === blockTestId)?.name;
+      setBlockMessage(`✅ "${testName}" blocked on ${blockDate} for ${locName}.`);
+      setBlockDate(""); setBlockReason("");
+      refetchDateBlocks();
+    } catch (err: any) {
+      setBlockError(err.message || "Failed to create block.");
+    } finally {
+      setBlockLoading(false);
+    }
+  }
+
+  async function deleteDateBlock(blockId: string, blockDateStr: string) {
+    if (!confirm(`Remove block for ${blockDateStr}?`)) return;
+    setBlockMessage(""); setBlockError("");
+    try {
+      await api(`/tests/${blockTestId}/date-blocks/${blockId}`, { method: "DELETE" });
+      setBlockMessage("Block removed.");
+      refetchDateBlocks();
+    } catch (err: any) {
+      setBlockError(err.message || "Failed to remove block.");
+    }
+  }
+
   // Slot editor actions
   const addSlotRow = () => {
-    setEditingSlots([...editingSlots, { label: "", capacity: 5, sortOrder: editingSlots.length + 1, active: true }]);
+    setEditingSlots([...editingSlots, { label: "", startTime: null, capacity: 5, sortOrder: editingSlots.length + 1, active: true }]);
   };
+
+  const generateSlots = () => {
+    setSlotMessage("");
+    setSlotError("");
+    const from = timeToMinutes(genFrom);
+    const to = timeToMinutes(genTo);
+    if (!(genEvery > 0) || to < from) {
+      setSlotError("Generator: the end time must be after the start time and the interval above 0.");
+      return;
+    }
+    const existing = new Set(editingSlots.map((s) => s.label.trim().toLowerCase()));
+    const created: EditableSlot[] = [];
+    for (let m = from; m <= to; m += genEvery) {
+      const time = minutesToTime(m);
+      const label = slotLabel(time, genSuffix);
+      if (existing.has(label.toLowerCase())) continue;
+      created.push({ label, startTime: time, capacity: genCapacity, sortOrder: 0, active: true });
+    }
+    if (created.length === 0) {
+      setSlotError("Generator: all of those slots already exist.");
+      return;
+    }
+    setEditingSlots(sortSlotsByTime([...editingSlots, ...created]));
+    setSlotMessage(`Added ${created.length} slot(s). Review them, then save.`);
+  };
+
+  const sortSlotsByTime = (list: EditableSlot[]) =>
+    [...list].sort((a, b) => {
+      const ta = a.startTime || parseTimeFromLabel(a.label);
+      const tb = b.startTime || parseTimeFromLabel(b.label);
+      if (ta && tb) return ta.localeCompare(tb);
+      return ta ? -1 : tb ? 1 : 0;
+    });
 
   const removeSlotRow = (index: number) => {
     setEditingSlots(editingSlots.filter((_, idx) => idx !== index));
   };
 
-  const updateSlotField = (index: number, field: "label" | "capacity" | "active", value: string | number | boolean) => {
+  const updateSlotField = (index: number, field: "label" | "startTime" | "capacity" | "active", value: string | number | boolean) => {
     const updated = [...editingSlots];
     if (field === "label") {
       updated[index].label = String(value);
+    } else if (field === "startTime") {
+      updated[index].startTime = value ? String(value) : null;
     } else if (field === "capacity") {
       updated[index].capacity = Number(value);
     } else if (field === "active") {
@@ -709,6 +973,17 @@ export default function AdminPage() {
       setSlotError("All slots must have a non-empty label.");
       return;
     }
+    const seen = new Set<string>();
+    const dup = editingSlots.find((s) => {
+      const key = s.label.trim().toLowerCase();
+      if (seen.has(key)) return true;
+      seen.add(key);
+      return false;
+    });
+    if (dup) {
+      setSlotError(`Duplicate slot label "${dup.label}". Each slot needs a unique name.`);
+      return;
+    }
     // Snapshot the current state we're about to save
     const snapshotSlots = [...editingSlots];
     try {
@@ -717,11 +992,22 @@ export default function AdminPage() {
         body: JSON.stringify({
           locationId: selectedLocationId,
           dayOfWeek: selectedSlotDay,
-          slots: snapshotSlots.map((s, idx) => ({ ...s, sortOrder: idx + 1 })),
+          applyToDays,
+          // Save the time the editor shows: explicit start time, else the one read from the label
+          slots: snapshotSlots.map((s, idx) => ({
+            label: s.label.trim(),
+            startTime: s.startTime || parseTimeFromLabel(s.label),
+            capacity: s.capacity,
+            active: s.active ?? true,
+            sortOrder: idx + 1
+          })),
           workDays: editingLocationWorkDays  // save per-center working days
         })
       });
-      setSlotMessage("Slot configuration saved successfully.");
+      setSlotMessage(applyToDays.length > 0
+        ? `Slot configuration saved for ${[selectedSlotDay, ...applyToDays].map((d) => d === "All" ? "All Days" : d).join(", ")}.`
+        : "Slot configuration saved successfully.");
+      setApplyToDays([]);
       await refetchTests();
       // Keep user's state — do NOT re-sync from refetched data here.
       // The refetch keeps cache fresh for other parts of UI, but the editor
@@ -743,6 +1029,7 @@ export default function AdminPage() {
     if (csvEndDate) params.set("endDate", csvEndDate);
     if (csvLocationId) params.set("locationId", csvLocationId);
     if (csvTestId) params.set("testId", csvTestId);
+    if (csvProName) params.set("proName", csvProName);
 
     const res = await fetch(`${API_URL}/admin/exports/appointments.csv?${params.toString()}`, {
       headers: { Authorization: `Bearer ${getToken()}` }
@@ -753,7 +1040,8 @@ export default function AdminPage() {
     link.href = url;
     const locName = csvLocationId ? locations.find(l => l.id === csvLocationId)?.name.replace(/\s+/g, "_") : "all";
     const testNameStr = csvTestId ? tests.find(t => t.id === csvTestId)?.name.replace(/\s+/g, "_") : "all";
-    link.download = `appointments_${locName}_${testNameStr}_${csvStartDate || "start"}_to_${csvEndDate || "end"}.csv`;
+    const proNameStr = csvProName ? csvProName.replace(/\s+/g, "_") : "all";
+    link.download = `appointments_${locName}_${testNameStr}_${proNameStr}_${csvStartDate || "start"}_to_${csvEndDate || "end"}.csv`;
     link.click();
     URL.revokeObjectURL(url);
   }
@@ -793,6 +1081,19 @@ export default function AdminPage() {
             </select>
           </div>
           <div className="flex items-center gap-1">
+            <span className="text-xs text-slate-500 font-medium">PRO:</span>
+            <select
+              className="input h-9 py-0 px-2 text-xs min-w-[140px]"
+              value={csvProName}
+              onChange={(e) => setCsvProName(e.target.value)}
+            >
+              <option value="">All PROs</option>
+              {proOptions.map((name) => (
+                <option key={name} value={name}>{name}</option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
             <span className="text-xs text-slate-500 font-medium">From:</span>
             <input
               type="date"
@@ -814,10 +1115,10 @@ export default function AdminPage() {
               placeholder="End Date"
             />
           </div>
-          {(csvStartDate || csvEndDate || csvLocationId || csvTestId) && (
+          {(csvStartDate || csvEndDate || csvLocationId || csvTestId || csvProName) && (
             <button
               className="text-xs text-slate-500 hover:text-red-500 border rounded-md px-2 h-9"
-              onClick={() => { setCsvStartDate(""); setCsvEndDate(""); setCsvLocationId(""); setCsvTestId(""); }}
+              onClick={() => { setCsvStartDate(""); setCsvEndDate(""); setCsvLocationId(""); setCsvTestId(""); setCsvProName(""); }}
               title="Clear filters"
             >
               ✕ Clear
@@ -825,6 +1126,13 @@ export default function AdminPage() {
           )}
           <button className="btn bg-gradient-to-r from-medical-600 to-medical-700 shadow-md hover:from-medical-500 hover:to-medical-600 h-9" onClick={exportCsv}>
             Export CSV
+          </button>
+          <button
+            type="button"
+            className="btn bg-indigo-600 hover:bg-indigo-700 text-white shadow-md text-xs h-9 flex items-center gap-1.5 font-semibold"
+            onClick={() => setShowDailySummaryModal(true)}
+          >
+            <span>📋 Daily Test Patient List</span>
           </button>
           {!isAnalytics && (
             <>
@@ -884,8 +1192,8 @@ export default function AdminPage() {
         )}
         <span className="ml-auto text-xs text-slate-400 italic">
           {(csvStartDate || csvEndDate)
-            ? `${csvStartDate || "start"} → ${csvEndDate || "end"}${csvLocationId ? " · filtered by location" : ""}${csvTestId ? ` · filtered by ${tests.find(t => t.id === csvTestId)?.name || "test"}` : ""}`
-            : `${new Date(chartMonth + "-01").toLocaleString("en-IN", { month: "long", year: "numeric" })}${csvLocationId ? " · filtered by location" : ""}${csvTestId ? ` · filtered by ${tests.find(t => t.id === csvTestId)?.name || "test"}` : ""}`
+            ? `${csvStartDate || "start"} → ${csvEndDate || "end"}${csvLocationId ? " · filtered by location" : ""}${csvTestId ? ` · filtered by ${tests.find(t => t.id === csvTestId)?.name || "test"}` : ""}${csvProName ? ` · filtered by PRO: ${csvProName}` : ""}`
+            : `${new Date(chartMonth + "-01").toLocaleString("en-IN", { month: "long", year: "numeric" })}${csvLocationId ? " · filtered by location" : ""}${csvTestId ? ` · filtered by ${tests.find(t => t.id === csvTestId)?.name || "test"}` : ""}${csvProName ? ` · filtered by PRO: ${csvProName}` : ""}`
           }
         </span>
       </div>
@@ -913,11 +1221,18 @@ export default function AdminPage() {
         <div className="card">
           <div className="flex items-center justify-between mb-3">
             <h2 className="font-semibold text-slate-800 dark:text-slate-200">Referral Source Distribution</h2>
-            {csvTestId && (
-              <span className="inline-flex items-center gap-1 text-xs px-2.5 py-0.5 rounded-full bg-medical-50 dark:bg-medical-950/40 text-medical-700 dark:text-medical-300 font-semibold border border-medical-200 dark:border-medical-800">
-                🧪 Test: {tests.find(t => t.id === csvTestId)?.name}
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              {csvProName && (
+                <span className="inline-flex items-center gap-1 text-xs px-2.5 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold border border-emerald-200 dark:border-emerald-800">
+                  👤 PRO: {csvProName}
+                </span>
+              )}
+              {csvTestId && (
+                <span className="inline-flex items-center gap-1 text-xs px-2.5 py-0.5 rounded-full bg-medical-50 dark:bg-medical-950/40 text-medical-700 dark:text-medical-300 font-semibold border border-medical-200 dark:border-medical-800">
+                  🧪 Test: {tests.find(t => t.id === csvTestId)?.name}
+                </span>
+              )}
+            </div>
           </div>
           {(() => {
             const referralData = (data?.byReferral || []).map(x => ({ name: x.referredBy || "Direct / Unknown", count: x._count })).sort((a, b) => b.count - a.count);
@@ -946,23 +1261,99 @@ export default function AdminPage() {
         </div>
         <div className="card flex flex-col justify-between">
           <div>
-            <h2 className="mb-3 font-semibold text-slate-800 dark:text-slate-200">System Activity &amp; Audit Trail</h2>
-            <p className="text-sm text-slate-600 dark:text-slate-400 mb-4 leading-relaxed">
-              All administrative operations, login events, booking changes, and modifications are immutably tracked for safety, compliance, and security.
-            </p>
-            <div className="rounded-lg border border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/50 p-4 space-y-2">
-              <div className="flex items-center gap-2 text-xs text-slate-500 font-medium">
-                <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
-                <span>Audit API Endpoint active</span>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h2 className="font-semibold text-slate-800 dark:text-slate-200">Agent-Wise Revenue Statistics</h2>
+                <p className="text-xs text-slate-500 mt-0.5">Revenue generated by booking agents (excluding cancelled)</p>
               </div>
-              <p className="text-xs text-slate-500 leading-normal">
-                Logs contain user references, remote IP addresses, HTTP headers, request context, and detailed JSON differences for all field edits.
-              </p>
+              <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                ₹{((data?.byAgent || []).reduce((sum, a) => sum + (a.revenue || 0), 0)).toLocaleString("en-IN")} Total
+              </span>
+            </div>
+
+            {/* Mini Summary Cards */}
+            {(() => {
+              const totalRev = (data?.byAgent || []).reduce((sum, a) => sum + (a.revenue || 0), 0);
+              const totalAdv = (data?.byAgent || []).reduce((sum, a) => sum + (a.advance || 0), 0);
+              const totalPen = (data?.byAgent || []).reduce((sum, a) => sum + (a.pending || 0), 0);
+              return (
+                <div className="grid grid-cols-3 gap-2 mb-3">
+                  <div className="rounded-lg bg-blue-50/70 dark:bg-blue-950/30 p-2 border border-blue-100 dark:border-blue-900/40">
+                    <p className="text-[10px] uppercase font-bold text-blue-600 dark:text-blue-400">Total Booked</p>
+                    <p className="text-sm font-bold text-blue-900 dark:text-blue-200 mt-0.5">₹{totalRev.toLocaleString("en-IN")}</p>
+                  </div>
+                  <div className="rounded-lg bg-emerald-50/70 dark:bg-emerald-950/30 p-2 border border-emerald-100 dark:border-emerald-900/40">
+                    <p className="text-[10px] uppercase font-bold text-emerald-600 dark:text-emerald-400">Advance Paid</p>
+                    <p className="text-sm font-bold text-emerald-900 dark:text-emerald-200 mt-0.5">₹{totalAdv.toLocaleString("en-IN")}</p>
+                  </div>
+                  <div className="rounded-lg bg-amber-50/70 dark:bg-amber-950/30 p-2 border border-amber-100 dark:border-amber-900/40">
+                    <p className="text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400">Pending</p>
+                    <p className="text-sm font-bold text-amber-900 dark:text-amber-200 mt-0.5">₹{totalPen.toLocaleString("en-IN")}</p>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Agent Revenue Table */}
+            <div className="overflow-y-auto max-h-[190px] border border-slate-100 dark:border-slate-800 rounded-lg">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b bg-slate-50 dark:bg-slate-800 text-slate-500 uppercase font-medium sticky top-0 z-10">
+                  <tr>
+                    <th className="p-2">Agent</th>
+                    <th className="p-2 text-center">Bookings</th>
+                    <th className="p-2 text-right">Revenue</th>
+                    <th className="p-2 text-right">Advance</th>
+                    <th className="p-2 text-right">Pending</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {[...(data?.byAgent || [])]
+                    .sort((a, b) => (b.revenue || 0) - (a.revenue || 0) || (b.count || 0) - (a.count || 0))
+                    .map((agent) => (
+                    <tr key={agent.agentId} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/30">
+                      <td className="p-2">
+                        <div className="font-semibold text-slate-800 dark:text-slate-100 truncate max-w-[110px]" title={agent.agentName}>
+                          {agent.agentName}
+                        </div>
+                        <span className={`inline-block px-1 py-0.2 rounded text-[8px] font-bold uppercase ${
+                          agent.role === "ADMIN" ? "text-purple-700 dark:text-purple-300" :
+                          agent.role === "FRONTDESK" ? "text-sky-700 dark:text-sky-300" :
+                          agent.role === "MARKETING" ? "text-orange-700 dark:text-orange-300" :
+                          "text-emerald-700 dark:text-emerald-300"
+                        }`}>
+                          {agent.role}
+                        </span>
+                      </td>
+                      <td className="p-2 text-center font-medium text-slate-600 dark:text-slate-300">{agent.count}</td>
+                      <td className="p-2 text-right font-bold text-slate-800 dark:text-slate-100">
+                        {agent.revenue ? `₹${agent.revenue.toLocaleString("en-IN")}` : "₹0"}
+                      </td>
+                      <td className="p-2 text-right text-emerald-600 dark:text-emerald-400 font-semibold">
+                        {agent.advance ? `₹${agent.advance.toLocaleString("en-IN")}` : "—"}
+                      </td>
+                      <td className="p-2 text-right">
+                        {(agent.pending || 0) > 0 ? (
+                          <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                            ₹{(agent.pending || 0).toLocaleString("en-IN")}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {(data?.byAgent || []).length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="p-4 text-center text-slate-400 italic">No agent revenue data found for this period.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
-          <div className="mt-4 border-t pt-4 text-xs text-slate-400 flex items-center justify-between">
-            <span>Database Status: Connected</span>
-            <span className="font-mono bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded">v1.0.4-live</span>
+          <div className="mt-3 border-t pt-2 text-[10px] text-slate-400 flex items-center justify-between">
+            <span>Agent performance live sync</span>
+            <span className="font-mono bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded">Live</span>
           </div>
         </div>
       </section>
@@ -978,7 +1369,9 @@ export default function AdminPage() {
             <span className="text-xs text-slate-400 font-medium">{(data?.byAgent || []).length} agents</span>
           </div>
           {(() => {
-            const agentData = (data?.byAgent || []).slice(0, 40);
+            const agentData = [...(data?.byAgent || [])]
+              .sort((a, b) => (b.count || 0) - (a.count || 0) || (b.revenue || 0) - (a.revenue || 0))
+              .slice(0, 40);
             const barW = Math.max(50, 600 / Math.max(agentData.length, 1));
             const chartWidth = Math.max(600, agentData.length * barW);
             const roleColors: Record<string, string> = { ADMIN: "#7c3aed", FRONTDESK: "#0ea5e9", MARKETING: "#f97316", TECHNICIAN: "#10b981" };
@@ -1026,13 +1419,16 @@ export default function AdminPage() {
                   <tr>
                     <th className="p-2">Agent Name</th>
                     <th className="p-2">Role</th>
-                    <th className="p-2 text-right">Bookings</th>
+                    <th className="p-2 text-center">Bookings</th>
+                    <th className="p-2 text-right">Revenue</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {(data?.byAgent || []).map((agent: any) => (
+                  {[...(data?.byAgent || [])]
+                    .sort((a, b) => (b.count || 0) - (a.count || 0) || (b.revenue || 0) - (a.revenue || 0))
+                    .map((agent: any) => (
                     <tr key={agent.agentId} className="hover:bg-slate-50/50">
-                      <td className="p-2 font-medium truncate max-w-[120px]" title={agent.agentName}>{agent.agentName}</td>
+                      <td className="p-2 font-medium truncate max-w-[110px]" title={agent.agentName}>{agent.agentName}</td>
                       <td className="p-2">
                         <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
                           agent.role === "ADMIN" ? "bg-purple-100 text-purple-800 dark:bg-purple-950/40 dark:text-purple-400" :
@@ -1043,12 +1439,15 @@ export default function AdminPage() {
                           {agent.role.slice(0, 5)}
                         </span>
                       </td>
-                      <td className="p-2 text-right font-semibold text-slate-700 dark:text-slate-300">{agent.count}</td>
+                      <td className="p-2 text-center font-semibold text-slate-700 dark:text-slate-300">{agent.count}</td>
+                      <td className="p-2 text-right font-bold text-slate-800 dark:text-slate-100">
+                        {agent.revenue ? `₹${agent.revenue.toLocaleString("en-IN")}` : "₹0"}
+                      </td>
                     </tr>
                   ))}
                   {(data?.byAgent || []).length === 0 && (
                     <tr>
-                      <td colSpan={3} className="p-4 text-center text-slate-400 italic">No bookings found.</td>
+                      <td colSpan={4} className="p-4 text-center text-slate-400 italic">No bookings found.</td>
                     </tr>
                   )}
                 </tbody>
@@ -1230,7 +1629,7 @@ export default function AdminPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {users.filter(u => ["ADMIN", "FRONTDESK", "ANALYTICS"].includes(u.role)).map((user) => (
+                {users.filter(u => ["FRONTDESK", "ANALYTICS"].includes(u.role)).map((user) => (
                   <tr className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30" key={user.id}>
                     <td className="p-3 font-medium text-slate-700 dark:text-slate-300">
                       <div>{user.name}</div>
@@ -1268,10 +1667,93 @@ export default function AdminPage() {
                     </td>
                   </tr>
                 ))}
-                {users.filter(u => ["ADMIN", "FRONTDESK", "ANALYTICS"].includes(u.role)).length === 0 && (
+                {users.filter(u => ["FRONTDESK", "ANALYTICS"].includes(u.role)).length === 0 && (
                   <tr>
                     <td className="p-3 text-slate-400 text-center" colSpan={4}>No users found.</td>
                   </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      {/* System Admin Accounts — Separate dedicated section */}
+      <section className="mb-6">
+        <div className="card flex flex-col space-y-4 border-l-4 border-l-purple-500">
+          <div>
+            <h2 className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
+              <span className="text-base">🛡️</span> System Admin Accounts
+            </h2>
+            <p className="text-sm text-slate-500">Create, edit, or delete full-access system administrator accounts. Handle with care — admins have unrestricted access.</p>
+          </div>
+          <form className="grid grid-cols-1 sm:grid-cols-3 gap-2" onSubmit={createAdminUser}>
+            <input className="input" name="adminName" placeholder="Full name" required />
+            <input className="input" name="adminEmail" type="email" placeholder="Email" required />
+            <input className="input" name="adminPassword" type="password" placeholder="Password (min 8)" minLength={8} required />
+            <button className="btn bg-purple-600 hover:bg-purple-700 sm:col-span-3">➕ Create Admin Account</button>
+          </form>
+          {adminMessage && <p className="rounded-md bg-green-50 dark:bg-green-950/20 p-2 text-xs text-green-700 dark:text-green-400 border border-green-200">{adminMessage}</p>}
+          {adminError && <p className="rounded-md bg-red-50 dark:bg-red-950/20 p-2 text-xs text-red-700 dark:text-red-400 border border-red-200">{adminError}</p>}
+
+          <div className="overflow-y-auto max-h-64 border rounded-lg">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b bg-slate-50 dark:bg-slate-800 text-slate-500 text-xs uppercase font-medium">
+                <tr>
+                  <th className="p-3">Admin Name</th>
+                  <th className="p-3">Email</th>
+                  <th className="p-3 text-center">Status</th>
+                  <th className="p-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                {users.filter(u => u.role === "ADMIN").map((user) => (
+                  <tr className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30" key={user.id}>
+                    <td className="p-3 font-medium text-slate-700 dark:text-slate-300">
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-purple-100 dark:bg-purple-950/50 text-purple-700 dark:text-purple-300 font-bold text-xs">
+                          {user.name.charAt(0).toUpperCase()}
+                        </span>
+                        {user.name}
+                        {user.email === "admin@diagnostic.local" && (
+                          <span className="text-[9px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 px-1.5 py-0.5 rounded uppercase">Primary</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="p-3 text-slate-600 dark:text-slate-400 text-xs">{user.email}</td>
+                    <td className="p-3 text-center">
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${user.active ? "bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400" : "bg-red-50 text-red-600 dark:bg-red-950/30 dark:text-red-400"}`}>
+                        {user.active ? "Active" : "Disabled"}
+                      </span>
+                    </td>
+                    <td className="p-3 text-right space-x-2">
+                      <button
+                        className="text-xs text-slate-500 hover:text-slate-700 font-medium"
+                        onClick={() => updateUser(user.id, { active: !user.active })}
+                        disabled={user.email === "admin@diagnostic.local"}
+                        title={user.email === "admin@diagnostic.local" ? "Cannot disable primary admin" : ""}
+                      >
+                        {user.active ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        className="text-xs text-indigo-600 hover:text-indigo-700 font-semibold"
+                        onClick={() => resetAdminPassword(user.id)}
+                      >
+                        Reset Password
+                      </button>
+                      <button
+                        className="text-xs text-red-500 hover:text-red-700 font-semibold"
+                        onClick={() => deleteAdmin(user.id, user.email)}
+                        disabled={user.email === "admin@diagnostic.local"}
+                        title={user.email === "admin@diagnostic.local" ? "Cannot delete primary admin" : ""}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {users.filter(u => u.role === "ADMIN").length === 0 && (
+                  <tr><td className="p-3 text-slate-400 text-center" colSpan={4}>No admin accounts found.</td></tr>
                 )}
               </tbody>
             </table>
@@ -1600,25 +2082,68 @@ export default function AdminPage() {
               </tbody>
             </table>
           </div>
-              {/* Test Management */}
+        {/* Test Management */}
         <div className="card flex flex-col space-y-4">
           <div>
             <h2 className="font-semibold text-slate-800 dark:text-slate-200">Test Type Management</h2>
-            <p className="text-sm text-slate-500">Add or remove diagnostic test types available for booking.</p>
+            <p className="text-sm text-slate-500">Add, color-code, and drag/reorder test types available for booking.</p>
           </div>
-          <form className="flex flex-col gap-2" onSubmit={createTest}>
-            <div className="flex gap-2">
+          <form className="flex flex-col gap-3 p-3 bg-slate-50/70 dark:bg-slate-800/40 rounded-lg border" onSubmit={createTest}>
+            <div className="flex flex-col sm:flex-row gap-2">
               <input
                 className="input flex-1"
                 value={testName}
                 onChange={(e) => setTestName(e.target.value)}
-                placeholder="e.g. MRI Brain, CT Chest, X-Ray"
+                placeholder="e.g. PET CT SCAN, MRI Brain, USG"
                 required
               />
               <button className="btn bg-medical-600 hover:bg-medical-700 whitespace-nowrap">Add Test</button>
             </div>
+
+            {/* Test Background Color Selector */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+                Background Color / Identity
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center gap-1.5 p-1 bg-white dark:bg-slate-900 border rounded-lg">
+                  {PRESET_TEST_COLORS.map(c => (
+                    <button
+                      type="button"
+                      key={c.hex}
+                      className={`w-6 h-6 rounded-full border-2 transition-transform hover:scale-110 ${testColor.toLowerCase() === c.hex.toLowerCase() ? "border-slate-800 dark:border-white scale-110 shadow-sm" : "border-transparent"}`}
+                      style={{ backgroundColor: c.hex }}
+                      onClick={() => setTestColor(c.hex)}
+                      title={c.name}
+                    />
+                  ))}
+                  <div className="relative flex items-center ml-1 pl-1 border-l">
+                    <input
+                      type="color"
+                      className="h-6 w-7 cursor-pointer border rounded bg-transparent p-0"
+                      value={testColor}
+                      onChange={(e) => setTestColor(e.target.value)}
+                      title="Custom Color"
+                    />
+                  </div>
+                </div>
+                {/* Live Preview Pill */}
+                <div
+                  className="px-3 py-1 rounded-md text-xs font-bold border shadow-sm flex items-center gap-1.5"
+                  style={{
+                    backgroundColor: testColor,
+                    color: getContrastColor(testColor),
+                    borderColor: testColor
+                  }}
+                >
+                  <span>Preview:</span>
+                  <span>{testName.trim() || "Test Name"}</span>
+                </div>
+              </div>
+            </div>
+
             <textarea
-              className="input w-full min-h-[80px]"
+              className="input w-full min-h-[60px] text-xs"
               value={testInstructions}
               onChange={(e) => setTestInstructions(e.target.value)}
               placeholder="Test instructions to be sent on WhatsApp (optional)"
@@ -1647,21 +2172,37 @@ export default function AdminPage() {
           </form>
           {testMessage && <p className="rounded-md bg-green-50 p-2 text-xs text-green-700">{testMessage}</p>}
           {testError && <p className="rounded-md bg-red-50 p-2 text-xs text-red-700">{testError}</p>}
-          <div className="overflow-y-auto max-h-60 border rounded-lg">
+
+          <div className="overflow-y-auto max-h-72 border rounded-lg">
             <table className="w-full text-left text-sm">
               <thead className="border-b bg-slate-50 dark:bg-slate-800 text-slate-500 text-xs uppercase font-medium">
                 <tr>
-                  <th className="p-3">Test Name</th>
+                  <th className="p-3 w-12 text-center">Order</th>
+                  <th className="p-3">Test Name &amp; Color</th>
                   <th className="p-3">Status</th>
                   <th className="p-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {tests.map((test) => (
-                  <tr key={test.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30">
+                {tests.map((test, index) => (
+                  <tr
+                    key={test.id}
+                    className={`hover:bg-slate-50/50 dark:hover:bg-slate-800/30 transition-colors ${draggedTestIndex === index ? 'opacity-40 bg-slate-100' : ''}`}
+                    draggable
+                    onDragStart={() => setDraggedTestIndex(index)}
+                    onDragOver={(e) => { e.preventDefault(); }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (draggedTestIndex !== null && draggedTestIndex !== index) {
+                        handleMoveTest(draggedTestIndex, index);
+                      }
+                      setDraggedTestIndex(null);
+                    }}
+                    onDragEnd={() => setDraggedTestIndex(null)}
+                  >
                     {editingTestId === test.id ? (
-                      <td className="p-3" colSpan={3}>
-                        <div className="flex flex-col gap-2">
+                      <td className="p-3" colSpan={4}>
+                        <div className="flex flex-col gap-2 p-2 bg-slate-50 dark:bg-slate-800/60 rounded-lg border">
                           <div className="flex gap-2">
                             <input
                               className="input flex-1 h-9"
@@ -1676,6 +2217,47 @@ export default function AdminPage() {
                               Cancel
                             </button>
                           </div>
+
+                          {/* Edit Background Color */}
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+                              Background Color
+                            </label>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="flex flex-wrap items-center gap-1.5 p-1 bg-white dark:bg-slate-900 border rounded-lg">
+                                {PRESET_TEST_COLORS.map(c => (
+                                  <button
+                                    type="button"
+                                    key={c.hex}
+                                    className={`w-5 h-5 rounded-full border-2 transition-transform hover:scale-110 ${editingTestColor.toLowerCase() === c.hex.toLowerCase() ? "border-slate-800 dark:border-white scale-110 shadow-sm" : "border-transparent"}`}
+                                    style={{ backgroundColor: c.hex }}
+                                    onClick={() => setEditingTestColor(c.hex)}
+                                    title={c.name}
+                                  />
+                                ))}
+                                <div className="relative flex items-center ml-1 pl-1 border-l">
+                                  <input
+                                    type="color"
+                                    className="h-5 w-6 cursor-pointer border rounded bg-transparent p-0"
+                                    value={editingTestColor}
+                                    onChange={(e) => setEditingTestColor(e.target.value)}
+                                    title="Custom Color"
+                                  />
+                                </div>
+                              </div>
+                              <div
+                                className="px-2.5 py-0.5 rounded-md text-xs font-bold border shadow-sm"
+                                style={{
+                                  backgroundColor: editingTestColor,
+                                  color: getContrastColor(editingTestColor),
+                                  borderColor: editingTestColor
+                                }}
+                              >
+                                {editingTestName.trim() || "Preview"}
+                              </div>
+                            </div>
+                          </div>
+
                           <textarea
                             className="input w-full min-h-[60px] text-xs"
                             value={editingTestInstructions}
@@ -1707,9 +2289,47 @@ export default function AdminPage() {
                       </td>
                     ) : (
                       <>
+                        <td className="p-3 text-center">
+                          <div className="flex items-center justify-center gap-1">
+                            <div className="cursor-grab active:cursor-grabbing text-slate-350 hover:text-slate-600" title="Drag to reorder">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/></svg>
+                            </div>
+                            <div className="flex flex-col text-[10px] leading-none text-slate-400">
+                              <button
+                                type="button"
+                                disabled={index === 0}
+                                onClick={() => handleMoveTest(index, index - 1)}
+                                className="hover:text-slate-700 disabled:opacity-20 px-0.5"
+                                title="Move Up"
+                              >
+                                ▲
+                              </button>
+                              <button
+                                type="button"
+                                disabled={index === tests.length - 1}
+                                onClick={() => handleMoveTest(index, index + 1)}
+                                className="hover:text-slate-700 disabled:opacity-20 px-0.5"
+                                title="Move Down"
+                              >
+                                ▼
+                              </button>
+                            </div>
+                          </div>
+                        </td>
                         <td className="p-3 font-medium text-slate-700 dark:text-slate-350">
-                          <div>{test.name}</div>
-                          <div className="text-[10px] text-slate-500 font-normal">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-bold shadow-sm border"
+                              style={{
+                                backgroundColor: test.color || "#e2e8f0",
+                                color: test.color ? getContrastColor(test.color) : "#334155",
+                                borderColor: test.color || "#cbd5e1"
+                              }}
+                            >
+                              {test.name}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-slate-500 font-normal mt-1">
                             Days: {test.workDays && test.workDays.length > 0 ? test.workDays.join(", ") : "None"}
                           </div>
                         </td>
@@ -1743,7 +2363,7 @@ export default function AdminPage() {
                   </tr>
                 ))}
                 {tests.length === 0 && (
-                  <tr><td className="p-3 text-slate-400 text-center" colSpan={3}>No test types configured.</td></tr>
+                  <tr><td className="p-3 text-slate-400 text-center" colSpan={4}>No test types configured.</td></tr>
                 )}
               </tbody>
             </table>
@@ -1951,23 +2571,95 @@ export default function AdminPage() {
                     <button className="btn h-8 px-2.5 bg-emerald-100 text-emerald-700 hover:bg-emerald-200 border border-emerald-355 dark:bg-emerald-950/40 dark:text-emerald-400 text-xs font-semibold" onClick={unblockAllSlots}>
                       ✅ Unblock All
                     </button>
+                    <button className="btn h-8 px-3 bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 text-xs font-semibold" onClick={() => setEditingSlots(sortSlotsByTime(editingSlots))}>
+                      ↕ Sort by Time
+                    </button>
                     <button className="btn h-8 px-3 bg-slate-200 text-slate-700 hover:bg-slate-300 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700 text-xs font-semibold" onClick={addSlotRow}>
                       + Add Timing Slot
                     </button>
                   </div>
                 </div>
 
+                {/* Slot generator */}
+                <div className="rounded-lg border border-indigo-100 bg-indigo-50/60 dark:bg-indigo-950/20 dark:border-indigo-900 p-3">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-indigo-700 dark:text-indigo-300 mb-2">Quick Generate Slots</p>
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="text-xs text-slate-600 dark:text-slate-400">
+                      From
+                      <input className="input h-9 w-28 block mt-1" type="time" value={genFrom} onChange={(e) => setGenFrom(e.target.value)} />
+                    </label>
+                    <label className="text-xs text-slate-600 dark:text-slate-400">
+                      To
+                      <input className="input h-9 w-28 block mt-1" type="time" value={genTo} onChange={(e) => setGenTo(e.target.value)} />
+                    </label>
+                    <label className="text-xs text-slate-600 dark:text-slate-400">
+                      Every
+                      <select className="input h-9 w-24 block mt-1" value={genEvery} onChange={(e) => setGenEvery(Number(e.target.value))}>
+                        {[10, 15, 20, 30, 45, 60, 90, 120].map((m) => <option key={m} value={m}>{m} min</option>)}
+                      </select>
+                    </label>
+                    <label className="text-xs text-slate-600 dark:text-slate-400">
+                      Capacity
+                      <input className="input h-9 w-20 block mt-1" type="number" min={1} max={100} value={genCapacity} onChange={(e) => setGenCapacity(Number(e.target.value))} onWheel={(e) => e.currentTarget.blur()} />
+                    </label>
+                    <label className="text-xs text-slate-600 dark:text-slate-400 flex-1 min-w-[140px]">
+                      Suffix (optional)
+                      <input className="input h-9 w-full block mt-1" placeholder="e.g. Fasting, Contrast" value={genSuffix} onChange={(e) => setGenSuffix(e.target.value)} />
+                    </label>
+                    <button className="btn h-9 px-3 bg-indigo-600 hover:bg-indigo-700 text-xs font-semibold" onClick={generateSlots}>
+                      Generate
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-indigo-600/80 dark:text-indigo-400/80 mt-2">
+                    Example: {genFrom ? slotLabel(genFrom, genSuffix) : "—"}. Each slot closes for booking once its start time has passed today.
+                  </p>
+                </div>
+
                 <div className="space-y-2 max-h-[350px] overflow-y-auto pr-2">
                   {editingSlots.map((slot, index) => (
-                    <div className="flex flex-wrap sm:flex-nowrap items-center gap-3 bg-white p-2 rounded-md border dark:bg-slate-900" key={index}>
+                    <div 
+                      className={`flex flex-wrap sm:flex-nowrap items-center gap-3 bg-white p-2 rounded-md border dark:bg-slate-900 ${draggedSlotIndex === index ? 'opacity-50' : ''}`} 
+                      key={index}
+                      draggable
+                      onDragStart={() => setDraggedSlotIndex(index)}
+                      onDragOver={(e) => { e.preventDefault(); }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggedSlotIndex === null || draggedSlotIndex === index) return;
+                        const newSlots = [...editingSlots];
+                        const [moved] = newSlots.splice(draggedSlotIndex, 1);
+                        newSlots.splice(index, 0, moved);
+                        setEditingSlots(newSlots);
+                        setDraggedSlotIndex(null);
+                      }}
+                      onDragEnd={() => setDraggedSlotIndex(null)}
+                    >
+                      <div className="cursor-grab active:cursor-grabbing text-slate-300 hover:text-slate-500">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/></svg>
+                      </div>
                       <span className="text-xs font-mono text-slate-400 w-6">#{index + 1}</span>
                       <input
                         className={`input flex-1 h-9 ${slot.active === false ? "line-through text-red-500 border-red-200 bg-red-50/20" : ""}`}
-                        placeholder="e.g. 09:00 AM - 10:00 AM"
+                        placeholder="e.g. 09:00 AM - Fasting"
                         value={slot.label}
                         onChange={(e) => updateSlotField(index, "label", e.target.value)}
                         required
                       />
+                      {(() => {
+                        const detected = parseTimeFromLabel(slot.label);
+                        return (
+                          <div className="flex items-center gap-1.5">
+                            <label className="text-xs text-slate-500 whitespace-nowrap">Starts:</label>
+                            <input
+                              className={`input w-28 h-9 ${!slot.startTime && !detected ? "border-amber-300" : ""}`}
+                              type="time"
+                              value={slot.startTime || detected || ""}
+                              onChange={(e) => updateSlotField(index, "startTime", e.target.value)}
+                              title={slot.startTime ? "Start time set manually" : detected ? "Read from the label; change it to override" : "No time found in the label: this slot never closes automatically"}
+                            />
+                          </div>
+                        );
+                      })()}
                       <div className="flex items-center gap-2">
                         <label className="text-xs text-slate-500 whitespace-nowrap">Capacity:</label>
                         <input
@@ -2038,6 +2730,39 @@ export default function AdminPage() {
                         </span>
                       </label>
                     ))}
+                  </div>
+                </div>
+
+                {/* Copy this slot set to other days in the same save */}
+                <div className="rounded-lg border border-emerald-100 bg-emerald-50/60 dark:bg-emerald-950/20 dark:border-emerald-900 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-300 mb-1">Also Apply These Slots To</p>
+                  <p className="text-xs text-emerald-700/80 dark:text-emerald-400/80 mb-3">
+                    Saves the same slots for every selected day, replacing what those days had. No need to set up each day one by one.
+                  </p>
+                  <div className="flex flex-wrap gap-x-4 gap-y-2 items-center">
+                    {["All", ...DAYS_OF_WEEK].filter((d) => d !== selectedSlotDay).map((day) => (
+                      <label key={day} className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          className="accent-emerald-600"
+                          checked={applyToDays.includes(day)}
+                          onChange={(e) => setApplyToDays(e.target.checked ? [...applyToDays, day] : applyToDays.filter((d) => d !== day))}
+                        />
+                        <span className={applyToDays.includes(day) ? "font-semibold text-emerald-700 dark:text-emerald-300" : "text-slate-500"}>
+                          {day === "All" ? "All Days (Default)" : day.slice(0, 3)}
+                        </span>
+                      </label>
+                    ))}
+                    <button
+                      type="button"
+                      className="text-xs text-emerald-700 dark:text-emerald-300 underline ml-2"
+                      onClick={() => setApplyToDays(DAYS_OF_WEEK.filter((d) => d !== selectedSlotDay))}
+                    >
+                      Select all weekdays
+                    </button>
+                    {applyToDays.length > 0 && (
+                      <button type="button" className="text-xs text-slate-500 underline" onClick={() => setApplyToDays([])}>Clear</button>
+                    )}
                   </div>
                 </div>
 
@@ -2289,6 +3014,168 @@ export default function AdminPage() {
       )}
 
       </>)}
+
+      {/* ─── Date Block Section ──────────────────────────────────────────────── */}
+      {!isAnalytics && (
+        <div className="card mb-6">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-xl">🚫</span>
+            <div>
+              <h2 className="text-base font-semibold text-slate-800 dark:text-slate-100">Block Test Date</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Block all bookings for a specific test on a particular date. Existing appointments are NOT cancelled — only new bookings will be prevented.</p>
+            </div>
+          </div>
+
+          {/* Form */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+            {/* Test picker */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Test *</label>
+              <select
+                id="block-test-select"
+                className="input"
+                value={blockTestId}
+                onChange={(e) => { setBlockTestId(e.target.value); setBlockMessage(""); setBlockError(""); }}
+              >
+                <option value="">— Select Test —</option>
+                {tests.map(t => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Location picker */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Location</label>
+              <select
+                id="block-location-select"
+                className="input"
+                value={blockLocationId}
+                onChange={(e) => setBlockLocationId(e.target.value)}
+              >
+                <option value="">All Centers (global block)</option>
+                {locations.map(l => (
+                  <option key={l.id} value={l.id}>{l.name}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Date picker */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Date *</label>
+              <input
+                id="block-date-input"
+                type="date"
+                className="input"
+                value={blockDate}
+                min={new Date().toISOString().slice(0, 10)}
+                onChange={(e) => setBlockDate(e.target.value)}
+                onClick={(e) => { try { (e.currentTarget as any).showPicker?.(); } catch (_) {} }}
+              />
+            </div>
+
+            {/* Reason */}
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-400">Reason <span className="font-normal text-slate-400">(optional)</span></label>
+              <input
+                id="block-reason-input"
+                type="text"
+                className="input"
+                placeholder="e.g. Machine maintenance"
+                value={blockReason}
+                onChange={(e) => setBlockReason(e.target.value)}
+                maxLength={500}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              id="block-create-btn"
+              className="btn-primary flex items-center gap-2 px-5 py-2 disabled:opacity-50"
+              onClick={createDateBlock}
+              disabled={blockLoading || !blockTestId || !blockDate}
+            >
+              {blockLoading ? (
+                <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" /></svg>
+              ) : "🚫"}
+              Block This Date
+            </button>
+            {blockMessage && <span className="text-xs text-emerald-600 font-semibold">{blockMessage}</span>}
+            {blockError && <span className="text-xs text-red-600 font-semibold">{blockError}</span>}
+          </div>
+
+          {/* Active blocks list */}
+          {blockTestId && (
+            <div className="mt-4">
+              <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                Active Blocks for "{tests.find(t => t.id === blockTestId)?.name}"
+                {dateBlocks.length > 0 && <span className="ml-1 text-red-500">({dateBlocks.length})</span>}
+              </h3>
+              {dateBlocks.length === 0 ? (
+                <p className="text-xs text-slate-400 italic">No date blocks configured for this test.</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-slate-500 border-b border-slate-200 dark:border-slate-700">
+                        <th className="pb-2 pr-4 font-semibold">Date</th>
+                        <th className="pb-2 pr-4 font-semibold">Location</th>
+                        <th className="pb-2 pr-4 font-semibold">Reason</th>
+                        <th className="pb-2 pr-4 font-semibold">Blocked By</th>
+                        <th className="pb-2 font-semibold">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dateBlocks
+                        .slice()
+                        .sort((a, b) => a.date.localeCompare(b.date))
+                        .map(block => {
+                          const dateStr = new Date(block.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+                          const isPast = new Date(block.date) < new Date(new Date().toISOString().slice(0, 10));
+                          return (
+                            <tr key={block.id} className={`border-b border-slate-100 dark:border-slate-800 ${isPast ? "opacity-50" : ""}`}>
+                              <td className="py-2 pr-4 font-semibold">
+                                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold ${
+                                  isPast ? "bg-slate-100 text-slate-500" : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300"
+                                }`}>
+                                  {isPast ? "⏱" : "🚫"} {dateStr}
+                                </span>
+                              </td>
+                              <td className="py-2 pr-4 text-slate-600 dark:text-slate-300">
+                                {block.location ? block.location.name : <span className="italic text-slate-400">All Centers</span>}
+                              </td>
+                              <td className="py-2 pr-4 text-slate-600 dark:text-slate-300 max-w-[200px] truncate">
+                                {block.reason || <span className="italic text-slate-400">—</span>}
+                              </td>
+                              <td className="py-2 pr-4 text-slate-400">{block.createdBy?.name}</td>
+                              <td className="py-2">
+                                <button
+                                  className="text-[11px] font-semibold text-red-600 hover:text-red-800 hover:underline transition-colors"
+                                  onClick={() => deleteDateBlock(block.id, dateStr)}
+                                >
+                                  Remove
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Daily Test Summary & Copyable WhatsApp List Modal */}
+      <DailyTestSummaryModal
+        isOpen={showDailySummaryModal}
+        onClose={() => setShowDailySummaryModal(false)}
+        defaultLocationId={csvLocationId}
+        defaultDate={csvStartDate || undefined}
+      />
     </Shell>
   );
 }

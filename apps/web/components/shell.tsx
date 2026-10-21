@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { CalendarDays, ClipboardList, FlaskConical, LogOut, Megaphone, Shield, Activity, BellRing, Bell } from "lucide-react";
+import { CalendarDays, ClipboardList, FlaskConical, LogOut, Megaphone, Shield, Activity, BellRing, Bell, BookOpen } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { getUser, logout } from "../lib/auth";
@@ -96,6 +96,18 @@ export function Shell({ children }: { children: React.ReactNode }) {
 
           {/* Nav */}
           <nav className="flex items-center gap-0.5 text-sm">
+            {/* SOP Button — Available for ALL IDs/Roles on the left of Dashboard */}
+            <Link
+              className={`nav-link ${pathname?.startsWith("/sop") ? "active" : ""}`}
+              href="/sop"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Standard Operating Procedure (SOP)"
+            >
+              <BookOpen className="h-4 w-4 text-medical-600 dark:text-medical-400" />
+              SOP
+            </Link>
+
             {isTech ? (
               <Link
                 className={`nav-link ${pathname === "/schedule" ? "active" : ""}`}
