@@ -1,0 +1,83 @@
+name: Deploy
+
+# Production deploys run only after CI passes on main, or when started by hand
+# (rollback / redeploy). The job never checks out code: it just asks the server
+# to deploy a commit SHA, and the server fetches and verifies that commit itself.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy = deploy a commit from main, rollback = return to the previous release"
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      sha:
+        description: "Full 40-char commit SHA on main to deploy (blank = latest main)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Resolve what to run
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_ACTION: ${{ inputs.action }}
+          INPUT_SHA: ${{ inputs.sha }}
+          MAIN_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "workflow_run" ]; then
+            action=deploy; sha="$RUN_SHA"
+          else
+            action="$INPUT_ACTION"; sha="${INPUT_SHA:-$MAIN_SHA}"
+          fi
+          case "$action" in
+            deploy)   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Not a full commit SHA: $sha"; exit 1; }
+                      echo "command=deploy $sha" >> "$GITHUB_OUTPUT" ;;
+            rollback) echo "command=rollback" >> "$GITHUB_OUTPUT" ;;
+            *)        echo "::error::Unknown action: $action"; exit 1 ;;
+          esac
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy on server
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          COMMAND: ${{ steps.target.outputs.command }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o ServerAliveInterval=30 \
+            "deploy@${DEPLOY_HOST}" "$COMMAND"
+
+      - name: Remove key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

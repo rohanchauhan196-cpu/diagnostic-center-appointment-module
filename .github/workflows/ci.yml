@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Only used so Prisma can load the schema; CI never connects to a database.
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Validate Prisma schema
+        working-directory: apps/api
+        run: npx prisma validate
+
+      - name: Typecheck API
+        run: npm run lint --workspace apps/api
+
+      - name: Typecheck web
+        working-directory: apps/web
+        run: npx tsc --noEmit
+
+      - name: Build API
+        run: npm run build --workspace apps/api
+
+      - name: Build web
+        run: npm run build --workspace apps/web
