@@ -6,9 +6,13 @@
 # command in ~deploy/.ssh/authorized_keys, so the requested command arrives in
 # SSH_ORIGINAL_COMMAND. Run by hand as the deploy user with arguments instead.
 #
-#   deploy <sha>    fetch, build, back up DB, migrate, switch, health-check (auto-rollback)
+# This script never connects to the database. A release that adds Prisma
+# migrations is refused until an admin has applied them by hand and listed
+# them in $APPLIED_MIGRATIONS.
+#
+#   deploy <sha>    fetch, build, switch, health-check (auto-rollback on failure)
 #   prepare <sha>   fetch and build only; does not touch the running site
-#   rollback        switch back to the previous successful release (DB is NOT rolled back)
+#   rollback        switch back to the previous successful release
 #   status          show the current release and recent history
 set -Eeuo pipefail
 umask 027
@@ -19,8 +23,8 @@ RELEASES="$APP_ROOT/releases"
 SHARED="$APP_ROOT/shared"
 CURRENT="$APP_ROOT/current"
 HISTORY="$APP_ROOT/history.log"
+APPLIED_MIGRATIONS="$APP_ROOT/applied-migrations.txt"
 KEEP_RELEASES=3
-KEEP_BACKUPS=14
 API_HEALTH=http://127.0.0.1:4000/health
 WEB_HEALTH=http://127.0.0.1:3000/login
 
@@ -38,7 +42,7 @@ read -r ACTION ARG EXTRA <<<"${SSH_ORIGINAL_COMMAND:-$*}" || true
 exec 9>"$APP_ROOT/.deploy.lock"
 flock -n 9 || die "Another deploy is already running"
 
-mkdir -p "$SHARED/logs" "$SHARED/backups"
+mkdir -p "$SHARED/logs"
 exec > >(tee -a "$SHARED/logs/deploy-$(date -u +%Y%m%dT%H%M%SZ).log") 2>&1
 
 valid_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "Not a full commit SHA: $1"; }
@@ -78,17 +82,27 @@ build_release() {
   touch "$dir/.build-ok"
 }
 
-backup_db() {
-  local sha=$1 url file
-  url=$(grep -E '^DATABASE_URL=' "$SHARED/env/api.env" | head -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//')
-  [ -n "$url" ] || die "DATABASE_URL missing from $SHARED/env/api.env"
-  url=${url%%\?*} # pg_dump rejects Prisma's ?schema= parameter
-  file="$SHARED/backups/pre-deploy-$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:7}.dump"
-  log "Backing up database"
-  pg_dump --format=custom --no-owner --file="$file" "$url"
-  chmod 600 "$file"
-  ls -1t "$SHARED"/backups/pre-deploy-*.dump | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm --
-  log "Backup written: $file"
+migrations_in() {
+  [ -d "$1/apps/api/prisma/migrations" ] || return 0
+  find "$1/apps/api/prisma/migrations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+}
+
+# Compares migration folders on disk only: anything in the new release that is
+# neither in the live release nor listed as applied by hand blocks the deploy.
+assert_no_new_migrations() {
+  local dir=$1 live new
+  live=$(readlink -f "$CURRENT" 2>/dev/null || true)
+  if [ -z "$live" ] || [ ! -d "$live" ]; then
+    log "No live release yet, skipping migration check (first deploy)"
+    return
+  fi
+  new=$(comm -23 <(migrations_in "$dir" | sort -u) \
+                 <({ migrations_in "$live"; cat "$APPLIED_MIGRATIONS" 2>/dev/null; } | sort -u))
+  if [ -n "$new" ]; then
+    log "This release adds database migrations:"
+    printf '  %s\n' $new
+    die "Deploys never change the database. Apply these by hand, add their names to $APPLIED_MIGRATIONS, then deploy again."
+  fi
 }
 
 switch_to() {
@@ -121,9 +135,7 @@ deploy() {
   local sha=$1 dir="$RELEASES/$1" prev
   valid_sha "$sha"
   build_release "$sha"
-  backup_db "$sha"
-  log "Running database migrations"
-  (cd "$dir/apps/api" && npx prisma migrate deploy)
+  assert_no_new_migrations "$dir"
 
   prev=$(readlink -f "$CURRENT" 2>/dev/null || true)
   log "Switching to ${sha:0:7}"
@@ -147,7 +159,7 @@ rollback() {
   live=$(basename "$(readlink -f "$CURRENT")")
   target=$(awk '{print $2}' "$HISTORY" 2>/dev/null | grep -vxF "$live" | tail -1 || true)
   [ -n "$target" ] && [ -f "$RELEASES/$target/.build-ok" ] || die "No previous release available"
-  log "Rolling back ${live:0:7} -> ${target:0:7} (database migrations are not reverted)"
+  log "Rolling back ${live:0:7} -> ${target:0:7}"
   switch_to "$RELEASES/$target"
   healthy || die "Rolled-back release is unhealthy, check pm2 logs"
   printf '%s %s rollback\n' "$(date -u +%FT%TZ)" "$target" >> "$HISTORY"

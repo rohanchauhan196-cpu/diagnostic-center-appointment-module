@@ -5,19 +5,22 @@ PR ─► CI: npm ci, prisma validate, typecheck, build (GitHub-hosted runner, n
 merge to main ─► CI passes ─► Deploy workflow waits in the "production" environment
    ─► ssh deploy@server "deploy <sha>"   (key can run only deploy.sh)
         deploy.sh: fetch <sha> from main ─► build in releases/<sha> (live site untouched)
-                   ─► pg_dump backup ─► prisma migrate deploy
+                   ─► refuse if the release adds a Prisma migration
                    ─► switch `current` symlink ─► pm2 reload ─► health check
                    ─► unhealthy? switch back to the previous release automatically
 ```
 
-Rollback: Actions → Deploy → Run workflow → `rollback`. Code goes back; database
-migrations do not, so restore from `shared/backups/` only if a migration itself broke things.
+**The pipeline never connects to the database.** It does not run migrations, seeds,
+backups or `db push`. A release whose `prisma/migrations` folder has something new is
+refused before the live site is touched; see [Releases with a migration](#releases-with-a-migration).
+
+Rollback: Actions → Deploy → Run workflow → `rollback`. Only code changes; the database is left alone.
 
 Rules:
-- Never run `prisma db push` against production. Schema changes ship as migrations
+- Never run `prisma db push` against production. Schema changes ship as migration folders
   (`npm run prisma:migrate --workspace apps/api` locally, commit the folder).
 - Migrations should be backward compatible with the previous release (add first,
-  remove in a later deploy), because rollback does not revert them.
+  remove in a later deploy), so that rolling back code still works.
 - Nothing gets copied to the server by hand anymore. If it is not on `main`, it is not in prod.
 
 ## Server layout
@@ -29,9 +32,9 @@ Rules:
   releases/<sha>/                     one folder per build (last 3 kept)
   current -> releases/<sha>           what PM2 runs
   history.log                         successful deploys
+  applied-migrations.txt              migrations an admin applied by hand (one name per line)
   shared/env/{api,web,root}.env       production env files (chmod 600)
   shared/uploads/                     prescriptions; linked into every release
-  shared/backups/                     pre-deploy pg_dump files (last 14 kept)
   shared/logs/                        one log per deploy
 ```
 
@@ -43,17 +46,16 @@ Run on the server as `ubuntu` (with sudo). Check each step's output before the n
 
 ```bash
 sudo adduser --disabled-password --gecos "" deploy
-sudo -u deploy mkdir -p /home/deploy/diagnostic/{releases,shared/{env,uploads,backups,logs}}
+sudo -u deploy mkdir -p /home/deploy/diagnostic/{releases,shared/{env,uploads,logs}}
 sudo install -d -o root -g root -m 755 /home/deploy/bin
 # copy deploy/server/deploy.sh to the server first (scp), then:
 sudo install -o root -g root -m 755 deploy.sh /home/deploy/bin/deploy.sh
-which node npm pm2 pg_dump git curl   # all must resolve for the deploy user too
+which node npm pm2 git curl   # all must resolve for the deploy user too
 ```
 
 If Node or PM2 live under `ubuntu`'s nvm, install them system-wide instead
 (NodeSource package + `sudo npm i -g pm2`), or put a `PATH=...` line in
-`/home/deploy/diagnostic/deploy.env`. `pg_dump` must be the same major version as
-the Postgres server (`sudo apt install postgresql-client-<version>`).
+`/home/deploy/diagnostic/deploy.env`.
 
 ### 2. Let the server fetch the repo (read-only)
 
@@ -95,24 +97,7 @@ sudo rsync -a $OLD/apps/api/public/uploads/ $S/uploads/
 sudo chown -R deploy:deploy $S && sudo chmod 600 $S/env/*.env
 ```
 
-### 4. Fix the migration history (prod was changed with `db push`)
-
-```bash
-cd /home/ubuntu/diagnostic-center-system/apps/api
-npx prisma migrate status
-# Shows which migrations Prisma thinks are missing. Check the real schema against the repo's:
-npx prisma migrate diff --from-url "$(grep ^DATABASE_URL= .env | cut -d= -f2- | tr -d '"')" \
-  --to-schema-datamodel prisma/schema.prisma --script
-```
-
-- If the diff is empty, the database already matches. Mark each listed migration as applied:
-  `npx prisma migrate resolve --applied <migration_folder_name>`
-- If the diff is not empty, stop: the database and repo disagree. Work out which side is right
-  and add a migration for the difference before going further.
-
-`npx prisma migrate status` must end with "Database schema is up to date!".
-
-### 5. Key for GitHub Actions
+### 4. Key for GitHub Actions
 
 On your own computer:
 
@@ -137,20 +122,23 @@ In GitHub → Settings → Environments → `production`:
 - Variable `DEPLOY_HOST`: the server IP.
 - Deployment branches: `main` only. Required reviewers: yourself (public repos, or GitHub Pro for private).
 
-### 6. Cut over from the old `ubuntu` PM2 processes
+### 5. Cut over from the old `ubuntu` PM2 processes
+
+The first deploy has no previous release to compare migrations against, so it only
+goes ahead safely if the commit's code matches what prod runs today (same schema).
 
 ```bash
 SHA=<commit on main to go live with>
 sudo -u deploy /home/deploy/bin/deploy.sh prepare $SHA     # builds; site still running the old way
 pm2 delete diagnostic-api diagnostic-web && pm2 save       # as ubuntu: old processes stop (downtime starts)
-sudo -u deploy /home/deploy/bin/deploy.sh deploy $SHA      # backup, migrate, start under deploy (seconds)
+sudo -u deploy /home/deploy/bin/deploy.sh deploy $SHA      # starts under deploy (seconds)
 sudo env PATH=$PATH pm2 startup systemd -u deploy --hp /home/deploy   # start on reboot
 ```
 
 nginx needs no change: the apps still listen on 3000 (web) and 4000 (API).
 Check the site, uploads and logins, then test a rollback from GitHub Actions once.
 
-### 7. Lock the server down
+### 6. Lock the server down
 
 Once your own SSH key login works:
 
@@ -162,3 +150,18 @@ sudo apt install -y fail2ban
 ```
 
 Keep the old `/home/ubuntu/diagnostic-center-system` folder for a week as a fallback, then remove it.
+
+## Releases with a migration
+
+When a merged change adds a folder under `apps/api/prisma/migrations/`, the Deploy
+workflow fails with "This release adds database migrations" and the live site keeps
+running the old code. To ship it, a person does the database part by hand:
+
+1. Take a backup and copy it off the server.
+2. Read the migration's `migration.sql` and run it against production yourself
+   (for example with `psql`, or `npx prisma migrate deploy` from a checkout of that commit).
+3. Record that it is done, so the pipeline lets the release through:
+   ```bash
+   echo <migration_folder_name> | sudo -u deploy tee -a /home/deploy/diagnostic/applied-migrations.txt
+   ```
+4. Re-run the Deploy workflow for that commit (Actions → Deploy → Run workflow).
