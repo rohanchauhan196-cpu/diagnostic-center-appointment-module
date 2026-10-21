@@ -2,7 +2,7 @@ import { Router } from "express";
 import { Role } from "@prisma/client";
 import { prisma } from "../config/db.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
-import { dayRange } from "../services/slots.js";
+import { dayRange, todayStr } from "../services/time.js";
 import { 
   sendMidnightAllLocationsReport, 
   sendGreenParkMorningReport, 
@@ -41,7 +41,7 @@ adminRouter.post("/test-paschim-vihar-email", requireRole(Role.ADMIN), async (_r
 
 
 adminRouter.get("/analytics", async (req, res) => {
-  const today = dayRange(new Date());
+  const today = dayRange(todayStr());
 
   // --- Date range resolution ---
   // Priority: custom startDate/endDate > month/year picker
@@ -51,6 +51,7 @@ adminRouter.get("/analytics", async (req, res) => {
   const qYear       = req.query.year       ? parseInt(String(req.query.year))  : null;
   const qLocationId = req.query.locationId ? String(req.query.locationId) : null;
   const qTestId     = req.query.testId     ? String(req.query.testId)     : null;
+  const qProName    = req.query.proName    ? String(req.query.proName)    : null;
 
   let rangeStart: Date;
   let rangeEnd: Date;
@@ -77,24 +78,26 @@ adminRouter.get("/analytics", async (req, res) => {
 
   const dateFilter = isFiltered ? { gte: rangeStart, lte: rangeEnd } : undefined;
 
-  // Build base where clause (date + optional location + optional test)
+  // Build base where clause (date + optional location + optional test + optional proName)
   const baseWhere: any = {};
   if (isFiltered)    baseWhere.appointmentDate = dateFilter;
   if (qLocationId)   baseWhere.locationId      = qLocationId;
   if (qTestId)       baseWhere.testId          = qTestId;
-  const hasWhere = isFiltered || !!qLocationId || !!qTestId;
+  if (qProName)      baseWhere.referredBy      = { equals: qProName, mode: "insensitive" };
+  const hasWhere = isFiltered || !!qLocationId || !!qTestId || !!qProName;
 
   // Where clause for agent counts (based on creation date: createdAt)
   const createdWhere: any = {
     status: { not: "CANCELLED" },
     ...(qLocationId ? { locationId: qLocationId } : {}),
     ...(qTestId ? { testId: qTestId } : {}),
+    ...(qProName ? { referredBy: { equals: qProName, mode: "insensitive" } } : {}),
     createdAt: isFiltered ? dateFilter : { gte: rangeStart }
   };
 
   const [total, todayCount, monthly, completed, cancelled, byTest, byReferral, byUser, byMarketingRaw] = await Promise.all([
     prisma.appointment.count(hasWhere ? { where: baseWhere } : undefined as any),
-    prisma.appointment.count({ where: { appointmentDate: { gte: today.start, lt: today.end }, ...(qLocationId ? { locationId: qLocationId } : {}), ...(qTestId ? { testId: qTestId } : {}) } }),
+    prisma.appointment.count({ where: { appointmentDate: { gte: today.start, lt: today.end }, ...(qLocationId ? { locationId: qLocationId } : {}), ...(qTestId ? { testId: qTestId } : {}), ...(qProName ? { referredBy: { equals: qProName, mode: "insensitive" } } : {}) } }),
     prisma.appointment.count({ where: { ...baseWhere, appointmentDate: isFiltered ? dateFilter : { gte: rangeStart } } }),
     prisma.appointment.count({ where: { ...baseWhere, status: "ARRIVED"   } }),
     prisma.appointment.count({ where: { ...baseWhere, status: "CANCELLED" } }),
@@ -103,7 +106,8 @@ adminRouter.get("/analytics", async (req, res) => {
     prisma.appointment.groupBy({
       by: ["createdById"],
       where: createdWhere,
-      _count: true
+      _count: true,
+      _sum: { totalPrice: true, advanceReceived: true }
     }),
     prisma.appointment.groupBy({
       by: ["createdById"],
@@ -140,34 +144,55 @@ adminRouter.get("/analytics", async (req, res) => {
   });
   const userMap = new Map(userRecords.map(u => [u.id, u]));
 
-  const countsMap = new Map<string, number>();
-  byUser.forEach(x => {
+  const userStatsMap = new Map<string, { count: number; revenue: number; advance: number; pending: number }>();
+  byUser.forEach((x: any) => {
     if (x.createdById) {
-      countsMap.set(x.createdById, mapCount(x, "createdById"));
+      const count = mapCount(x, "createdById");
+      const revenue = x._sum?.totalPrice ?? 0;
+      const advance = x._sum?.advanceReceived ?? 0;
+      const pending = Math.max(revenue - advance, 0);
+      userStatsMap.set(x.createdById, { count, revenue, advance, pending });
     }
   });
 
-  const agentMap = new Map<string, { agentId: string; agentName: string; role: string; count: number }>();
+  const agentMap = new Map<string, { 
+    agentId: string; 
+    agentName: string; 
+    role: string; 
+    count: number;
+    revenue: number;
+    advance: number;
+    pending: number;
+  }>();
+
   for (const u of activeStaffUsers) {
+    const stats = userStatsMap.get(u.id) || { count: 0, revenue: 0, advance: 0, pending: 0 };
     agentMap.set(u.id, {
       agentId: u.id,
       agentName: u.name,
       role: u.role,
-      count: countsMap.get(u.id) || 0
+      ...stats
     });
   }
   for (const x of byUser) {
     if (x.createdById && !agentMap.has(x.createdById)) {
       const u = userMap.get(x.createdById);
+      const count = mapCount(x, "createdById");
+      const revenue = (x as any)._sum?.totalPrice ?? 0;
+      const advance = (x as any)._sum?.advanceReceived ?? 0;
+      const pending = Math.max(revenue - advance, 0);
       agentMap.set(x.createdById, {
         agentId: x.createdById,
         agentName: u?.name || x.createdById || "Unknown",
         role: u?.role || "FRONTDESK",
-        count: mapCount(x, "createdById")
+        count,
+        revenue,
+        advance,
+        pending
       });
     }
   }
-  const byAgentList = Array.from(agentMap.values()).sort((a, b) => b.count - a.count);
+  const byAgentList = Array.from(agentMap.values()).sort((a, b) => b.revenue - a.revenue || b.count - a.count);
 
   res.json({
     kpis: { total, today: todayCount, monthly, completed, cancelled },
@@ -185,7 +210,7 @@ adminRouter.get("/audits", async (_req, res) => {
 });
 
 adminRouter.get("/exports/appointments.csv", async (req, res) => {
-  const { startDate, endDate, locationId, testId } = req.query;
+  const { startDate, endDate, locationId, testId, proName } = req.query;
   const where: any = {};
 
   if (startDate || endDate) {
@@ -208,6 +233,10 @@ adminRouter.get("/exports/appointments.csv", async (req, res) => {
 
   if (testId) {
     where.testId = String(testId);
+  }
+
+  if (proName) {
+    where.referredBy = { equals: String(proName), mode: "insensitive" };
   }
 
   const rows = await prisma.appointment.findMany({

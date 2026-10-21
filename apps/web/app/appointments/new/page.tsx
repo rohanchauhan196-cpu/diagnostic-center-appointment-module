@@ -5,14 +5,35 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { Shell } from "../../../components/shell";
 import { ProNameAutocomplete } from "../../../components/ProNameAutocomplete";
-import { api } from "../../../lib/api";
+import { api, uploadFile, API_URL } from "../../../lib/api";
 import { socket } from "../../../lib/socket";
 import { getUser } from "../../../lib/auth";
 import { getUsgSubTestOptions } from "../../../lib/usgTests";
 import { AppointmentSuccessPopup } from "../../../components/AppointmentSuccessPopup";
+import { AppointmentAssistantPanel, DayAvailability } from "../../../components/AppointmentAssistantPanel";
 
-type Test = { id: string; name: string; workDays?: string[]; locationWorkDays?: string[] | null; instructions?: string | null; };
-type Slot = { label: string; capacity: number; left: number; full: boolean };
+type Test = { id: string; name: string; workDays?: string[]; locationWorkDays?: string[] | null; instructions?: string | null; color?: string; sortOrder?: number; };
+
+function getContrastColor(hexColor?: string | null) {
+  if (!hexColor || !hexColor.startsWith("#")) return "#0f172a";
+  const hex = hexColor.replace("#", "");
+  let r = 0, g = 0, b = 0;
+  if (hex.length === 3) {
+    r = parseInt(hex[0] + hex[0], 16);
+    g = parseInt(hex[1] + hex[1], 16);
+    b = parseInt(hex[2] + hex[2], 16);
+  } else if (hex.length === 6) {
+    r = parseInt(hex.substring(0, 2), 16);
+    g = parseInt(hex.substring(2, 4), 16);
+    b = parseInt(hex.substring(4, 6), 16);
+  } else {
+    return "#0f172a";
+  }
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.55 ? "#0f172a" : "#ffffff";
+}
+// past = slot time has already gone by today (only admins may still book it, e.g. walk-ins)
+type Slot = { label: string; startTime?: string | null; capacity: number; left: number; full: boolean; past?: boolean };
 type Location = { id: string; name: string; active: boolean; mapLink?: string | null; qrCodeUrl?: string | null; address?: string | null; };
 type Appointment = {
   id: string;
@@ -26,7 +47,9 @@ type Appointment = {
 };
 
 function validatePhone(val: string) {
-  return /^\+?[0-9]{10,15}$/.test(val.trim());
+  const trimmed = val.trim();
+  if (trimmed === "") return true; // empty is allowed
+  return /^[0-9]{10}$/.test(trimmed);
 }
 
 function parseAgeInYears(ageStr: string): number | null {
@@ -57,7 +80,7 @@ export default function NewAppointmentPage() {
   const [patientName, setPatientName] = useState("");
   const [testId, setTestId] = useState("");
   const [locationId, setLocationId] = useState("");
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(new Date().toLocaleDateString("en-CA"));
   const [phoneNumber, setPhoneNumber] = useState("");
   const [phoneError, setPhoneError] = useState("");
   const [patientAge, setPatientAge] = useState("");
@@ -75,6 +98,13 @@ export default function NewAppointmentPage() {
 
   const [isPopupOpen, setIsPopupOpen] = useState(false);
   const [popupData, setPopupData] = useState<any>(null);
+
+  // Prescription / Scan fields (MRI & USG Special Study)
+  const [scanName, setScanName] = useState("");
+  const [prescriptionFile, setPrescriptionFile] = useState<File | null>(null);
+  const [prescriptionUrl, setPrescriptionUrl] = useState("");
+  const [uploadError, setUploadError] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
 
 
 
@@ -170,6 +200,12 @@ export default function NewAppointmentPage() {
     queryFn: () => api<Slot[]>(`/appointments/availability?testId=${testId}&locationId=${locationId}&date=${date}`)
   });
 
+  const { data: upcomingDays = [], isLoading: isLoadingUpcomingDays } = useQuery<DayAvailability[]>({
+    queryKey: ["upcoming-availability", testId, locationId],
+    enabled: Boolean(testId && locationId),
+    queryFn: () => api<DayAvailability[]>(`/appointments/upcoming-availability?testId=${testId}&locationId=${locationId}&startDate=${new Date().toLocaleDateString("en-CA")}&days=7`)
+  });
+
   const filteredTestsForUser = useMemo(() => {
     if (user?.role === "TECHNICIAN" && user?.testTypes && user.testTypes.length > 0) {
       const allowedIds = user.testTypes.map((t) => t.id);
@@ -200,7 +236,10 @@ export default function NewAppointmentPage() {
 
   useEffect(() => {
     socket.connect();
-    socket.on("slots:changed", () => queryClient.invalidateQueries({ queryKey: ["slots"] }));
+    socket.on("slots:changed", () => {
+      queryClient.invalidateQueries({ queryKey: ["slots"] });
+      queryClient.invalidateQueries({ queryKey: ["upcoming-availability"] });
+    });
     return () => { socket.off("slots:changed"); socket.disconnect(); };
   }, [queryClient]);
 
@@ -216,10 +255,49 @@ export default function NewAppointmentPage() {
   const selectedTest = tests.find((t) => t.id === testId);
   const isDTPA = selectedTest ? selectedTest.name.toLowerCase() === "dtpa" : false;
   const isHSG = selectedTest ? selectedTest.name.toLowerCase().includes("hsg") : false;
+  const isMRI = selectedTest ? selectedTest.name.toLowerCase().includes("mri") : false;
+  const isUSGSpecial = selectedTest
+    ? (selectedTest.name.toLowerCase().includes("usg") && selectedTest.name.toLowerCase().includes("special"))
+    : false;
+  const needsPrescription = isMRI || isUSGSpecial;
   const usgSubOptions = getUsgSubTestOptions(selectedTest?.name);
 
   const selectedSubTestName = usgSubOptions.length > 0 ? (subTest || usgSubOptions[0]) : "";
   const isTVS = selectedSubTestName.toLowerCase().includes("tvs");
+
+  // Clear prescription state when switching away from MRI/USG Special
+  useEffect(() => {
+    if (!needsPrescription) {
+      setScanName("");
+      setPrescriptionFile(null);
+      setPrescriptionUrl("");
+      setUploadError("");
+    }
+  }, [needsPrescription]);
+
+  async function handlePrescriptionFile(file: File) {
+    setUploadError("");
+    if (file.size > 5 * 1024 * 1024) {
+      setUploadError("File too large — maximum 5 MB allowed.");
+      return;
+    }
+    const allowed = ["image/jpeg", "image/png", "image/jpg", "application/pdf"];
+    if (!allowed.includes(file.type)) {
+      setUploadError("Only PDF, JPG, or PNG files are accepted.");
+      return;
+    }
+    setIsUploading(true);
+    setPrescriptionFile(file);
+    try {
+      const result = await uploadFile(file);
+      setPrescriptionUrl(result.url);
+    } catch (e: any) {
+      setUploadError(e.message || "Upload failed. Please try again.");
+      setPrescriptionFile(null);
+    } finally {
+      setIsUploading(false);
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -227,13 +305,15 @@ export default function NewAppointmentPage() {
     const formEl = event.currentTarget;
     const form = new FormData(formEl);
 
-    // Validate referredBy (PRO Name) must exist in the master list (for all roles)
-    if (referredBy && referredBy.trim()) {
-      const isValid = proNames.some((p) => p.name.toLowerCase() === referredBy.toLowerCase());
-      if (!isValid) {
-        setError("Please select a valid PRO Name from the dropdown list. Custom names are not allowed.");
-        return;
-      }
+    // Validate referredBy (PRO Name) — required field
+    if (!referredBy || !referredBy.trim()) {
+      setError("PRO Name is required. Please select a PRO Name before creating the appointment.");
+      return;
+    }
+    const isValidPro = proNames.some((p) => p.name.toLowerCase() === referredBy.toLowerCase());
+    if (!isValidPro) {
+      setError("Please select a valid PRO Name from the dropdown list. Custom names are not allowed.");
+      return;
     }
 
     // Validate TVS inputs
@@ -274,7 +354,7 @@ export default function NewAppointmentPage() {
     }
 
     if (phoneNumber.trim() !== "" && !validatePhone(phoneNumber)) {
-      setPhoneError("Enter a valid phone number (10–15 digits)");
+      setPhoneError("Enter a valid 10-digit phone number (digits only)");
       return;
     }
     setPhoneError("");
@@ -320,6 +400,8 @@ export default function NewAppointmentPage() {
           subTest: usgSubOptions.length > 0 ? (subTest || usgSubOptions[0]) : undefined,
           isPregnant: isTVS ? (isPregnant === "true") : undefined,
           preferredDoctor: isTVS ? preferredDoctor : undefined,
+          scanName: needsPrescription ? scanName.trim() || undefined : undefined,
+          prescriptionUrl: needsPrescription ? prescriptionUrl || undefined : undefined,
         })
       });
       
@@ -343,6 +425,9 @@ export default function NewAppointmentPage() {
         qrCodeUrl: activeLocation?.qrCodeUrl || null,
         address: activeLocation?.address || null,
         proName: referredBy || result.referredBy || null,
+        scanName: needsPrescription ? (scanName.trim() || null) : null,
+        cityHospital: (form.get("cityHospital") as string)?.trim() || result.cityHospital || null,
+        referredDoctor: (form.get("referredDoctor") as string)?.trim() || result.referredDoctor || null,
       });
       setIsPopupOpen(true);
       
@@ -353,11 +438,14 @@ export default function NewAppointmentPage() {
 
   return (
     <Shell>
-      <form onSubmit={submit} className="card mx-auto max-w-4xl space-y-5">
-        <div>
-          <h1 className="text-2xl font-semibold">Create Appointment</h1>
-          <p className="text-sm text-slate-500">Slot capacity updates in real time.</p>
-        </div>        {/* Patient */}
+      <div className="mx-auto max-w-7xl">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+          {/* Main Appointment Form */}
+          <form onSubmit={submit} className="card space-y-5 xl:col-span-7 2xl:col-span-8 shadow-sm">
+            <div>
+              <h1 className="text-2xl font-semibold">Create Appointment</h1>
+              <p className="text-sm text-slate-500">Slot capacity updates in real time.</p>
+            </div>        {/* Patient */}
         <section className={isDTPA ? "grid gap-3 md:grid-cols-3" : "grid gap-3 md:grid-cols-2"}>
           <div>
             <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Patient Name *</label>
@@ -377,9 +465,18 @@ export default function NewAppointmentPage() {
               name="phoneNumber"
               placeholder="10-digit mobile number (optional)"
               value={phoneNumber}
-              onChange={(e) => { setPhoneNumber(e.target.value); setPhoneError(""); }}
+              maxLength={10}
+              inputMode="numeric"
+              onChange={(e) => {
+                const val = e.target.value.replace(/\D/g, "").slice(0, 10);
+                setPhoneNumber(val);
+                setPhoneError("");
+              }}
             />
             {phoneError && <p className="text-xs text-red-600 mt-1">{phoneError}</p>}
+            {phoneNumber.trim() !== "" && phoneNumber.trim().length < 10 && !phoneError && (
+              <p className="text-xs text-amber-500 mt-1">{10 - phoneNumber.trim().length} more digit{10 - phoneNumber.trim().length !== 1 ? "s" : ""} needed</p>
+            )}
           </div>
           {isDTPA && (
             <div>
@@ -555,9 +652,43 @@ export default function NewAppointmentPage() {
           </div>
           <div>
             <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Test Type *</label>
-            <select className="input w-full" value={testId} onChange={(e) => { setTestId(e.target.value); setSubTest(""); }} required>
-              {filteredTestsForUser.map((t) => <option value={t.id} key={t.id}>{t.name}</option>)}
-            </select>
+            {(() => {
+              const currentTest = filteredTestsForUser.find(t => t.id === testId);
+              const testBg = currentTest?.color;
+              const testText = testBg ? getContrastColor(testBg) : undefined;
+              return (
+                <select 
+                  className="input w-full font-bold transition-all duration-150" 
+                  style={{ 
+                    backgroundColor: testBg || undefined,
+                    color: testText || 'inherit',
+                    borderColor: testBg || undefined
+                  }}
+                  value={testId} 
+                  onChange={(e) => { setTestId(e.target.value); setSubTest(""); }} 
+                  required
+                >
+                  {filteredTestsForUser.map((t) => {
+                    const optBg = t.color;
+                    const optColor = optBg ? getContrastColor(optBg) : '#0f172a';
+                    return (
+                      <option 
+                        value={t.id} 
+                        key={t.id} 
+                        style={{ 
+                          backgroundColor: optBg || '#ffffff', 
+                          color: optColor,
+                          fontWeight: 'bold',
+                          padding: '6px 10px'
+                        }}
+                      >
+                        {t.name}
+                      </option>
+                    );
+                  })}
+                </select>
+              );
+            })()}
           </div>
           {usgSubOptions.length > 0 && (
             <div>
@@ -594,7 +725,7 @@ export default function NewAppointmentPage() {
                 type="date"
                 className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
                 value={date}
-                min={new Date().toISOString().slice(0, 10)}
+                min={new Date().toLocaleDateString("en-CA")}
                 onChange={(e) => setDate(e.target.value)}
                 onClick={(e) => {
                   try {
@@ -639,21 +770,127 @@ export default function NewAppointmentPage() {
           </section>
         )}
 
+        {/* Prescription Upload — MRI & USG Special Study */}
+        {needsPrescription && (
+          <section className="rounded-xl border-2 border-violet-200 bg-violet-50/40 dark:bg-violet-950/20 dark:border-violet-800/50 p-4 space-y-3">
+            <div className="flex items-center gap-2 pb-1 border-b border-violet-200 dark:border-violet-800/40">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-violet-600 dark:text-violet-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-violet-700 dark:text-violet-300">
+                {selectedTest?.name} — Prescription (Optional)
+              </h3>
+            </div>
+
+            {/* Scan Name */}
+            <div>
+              <label className="block text-xs font-semibold text-violet-700 dark:text-violet-300 uppercase mb-1">
+                Scan Name / Procedure
+              </label>
+              <input
+                className="input w-full"
+                placeholder="e.g. MRI Brain with Contrast, MRI Spine L-S, USG Abdomen Special..."
+                value={scanName}
+                onChange={(e) => setScanName(e.target.value)}
+              />
+            </div>
+
+            {/* Prescription Upload */}
+            <div>
+              <label className="block text-xs font-semibold text-violet-700 dark:text-violet-300 uppercase mb-1">
+                Upload Prescription
+                <span className="ml-2 text-[10px] font-normal text-slate-400 normal-case">(PDF, JPG, PNG · max 5 MB)</span>
+              </label>
+
+              {!prescriptionUrl ? (
+                <label
+                  className={`flex flex-col items-center justify-center gap-2 w-full min-h-[90px] border-2 border-dashed rounded-xl cursor-pointer transition-all ${
+                    isUploading
+                      ? "border-violet-300 bg-violet-50/60 dark:bg-violet-900/20"
+                      : "border-violet-300 hover:border-violet-500 bg-violet-50/30 hover:bg-violet-50/60 dark:bg-violet-950/20 dark:hover:bg-violet-900/20"
+                  }`}
+                >
+                  {isUploading ? (
+                    <div className="flex flex-col items-center gap-1.5">
+                      <span className="h-6 w-6 rounded-full border-2 border-violet-500 border-t-transparent animate-spin" />
+                      <span className="text-xs text-violet-600 dark:text-violet-400 font-medium">Uploading...</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-1.5 pointer-events-none">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                      </svg>
+                      <span className="text-xs font-semibold text-violet-600 dark:text-violet-400">Click to upload prescription</span>
+                      <span className="text-[10px] text-slate-400">or drag & drop here</span>
+                    </div>
+                  )}
+                  <input
+                    type="file"
+                    accept=".pdf,.jpg,.jpeg,.png"
+                    className="sr-only"
+                    disabled={isUploading}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handlePrescriptionFile(f);
+                    }}
+                  />
+                </label>
+              ) : (
+                <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50/60 dark:bg-emerald-950/20 dark:border-emerald-800/50 px-4 py-3">
+                  <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-emerald-100 dark:bg-emerald-900/40">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4.5 w-4.5 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 truncate">
+                      {prescriptionFile?.name || "Prescription uploaded"}
+                    </p>
+                    <p className="text-[10px] text-emerald-600/70 dark:text-emerald-400/70">
+                      {prescriptionFile ? `${(prescriptionFile.size / 1024).toFixed(0)} KB` : ""} · Upload successful
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setPrescriptionUrl(""); setPrescriptionFile(null); setUploadError(""); }}
+                    className="text-xs text-slate-400 hover:text-red-500 transition-colors font-medium ml-auto shrink-0"
+                  >
+                    ✕ Remove
+                  </button>
+                </div>
+              )}
+
+              {uploadError && (
+                <p className="mt-1.5 text-xs text-red-600 flex items-center gap-1">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                  </svg>
+                  {uploadError}
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
         {/* Slots */}
         <div>
           <label className="block text-xs font-semibold text-slate-500 uppercase mb-2">Available Timing Slots *</label>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {slots.map((slot) => (
-              <label
-                className={`rounded-md border p-3 text-sm flex items-center cursor-pointer transition ${slot.full ? "border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed"
-                  : "border-medical-100 bg-medical-50 text-medical-700 hover:border-medical-300"
-                  }`}
-                key={slot.label}
-              >
-                <input className="mr-2 accent-medical-600" name="slot" type="radio" value={slot.label} disabled={slot.full} required />
-                <span>{slot.label} ({slot.full ? "FULL" : `${slot.left} left`})</span>
-              </label>
-            ))}
+            {slots.map((slot) => {
+              const blocked = slot.full || (slot.past && !isAdmin);
+              return (
+                <label
+                  className={`rounded-md border p-3 text-sm flex items-center cursor-pointer transition ${blocked ? "border-slate-200 bg-slate-100 text-slate-400 cursor-not-allowed"
+                    : slot.past ? "border-amber-200 bg-amber-50 text-amber-800 hover:border-amber-300"
+                    : "border-medical-100 bg-medical-50 text-medical-700 hover:border-medical-300"
+                    }`}
+                  key={slot.label}
+                >
+                  <input className="mr-2 accent-medical-600" name="slot" type="radio" value={slot.label} disabled={blocked} required />
+                  <span>{slot.label} ({slot.full ? "FULL" : slot.past ? (isAdmin ? `time passed · ${slot.left} left` : "Time passed") : `${slot.left} left`})</span>
+                </label>
+              );
+            })}
             {slots.length === 0 && (
               <div className="p-4 text-center text-slate-400 text-xs col-span-3 border-2 border-dashed rounded-lg bg-slate-50">
                 {(() => {
@@ -748,7 +985,9 @@ export default function NewAppointmentPage() {
         {/* Extra info */}
         <section className={(isSpecialLocation || isHSG) ? "grid gap-3 md:grid-cols-3" : "grid gap-3 md:grid-cols-2"}>
           <div>
-            <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">PRO Name</label>
+            <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+              PRO Name <span className="text-red-500">*</span>
+            </label>
             <ProNameAutocomplete
               value={referredBy}
               onChange={setReferredBy}
@@ -790,6 +1029,20 @@ export default function NewAppointmentPage() {
           Create Appointment
         </button>
       </form>
+
+      {/* Right Assistant Panel */}
+      <div className="xl:col-span-5 2xl:col-span-4 xl:sticky xl:top-24">
+        <AppointmentAssistantPanel
+          selectedTest={selectedTest}
+          selectedLocation={selectedLocation}
+          selectedDate={date}
+          onSelectDate={(newDate) => setDate(newDate)}
+          upcomingDays={upcomingDays}
+          isLoadingDays={isLoadingUpcomingDays}
+        />
+      </div>
+    </div>
+  </div>
       
       <AppointmentSuccessPopup 
         isOpen={isPopupOpen} 

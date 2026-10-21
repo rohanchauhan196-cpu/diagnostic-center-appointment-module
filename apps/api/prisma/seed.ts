@@ -38,18 +38,33 @@ async function main() {
 
   for (const [name, slots] of Object.entries(slotSets)) {
     const test = await prisma.testType.upsert({ where: { name }, update: {}, create: { name } });
-    for (const [index, [label, capacity]] of slots.entries()) {
-      await prisma.slotConfiguration.upsert({
-        where: { testId_locationId_dayOfWeek_label: { testId: test.id, locationId: gwalior.id, dayOfWeek: "All", label } },
-        update: { capacity, sortOrder: index },
-        create: { testId: test.id, locationId: gwalior.id, dayOfWeek: "All", label, capacity, sortOrder: index }
-      });
 
-      await prisma.slotConfiguration.upsert({
-        where: { testId_locationId_dayOfWeek_label: { testId: test.id, locationId: delhi.id, dayOfWeek: "All", label } },
-        update: { capacity: capacity + 2, sortOrder: index },
-        create: { testId: test.id, locationId: delhi.id, dayOfWeek: "All", label, capacity: capacity + 2, sortOrder: index }
-      });
+    // Only seed default slots if NO slots are configured yet for this test+center.
+    // This prevents the seed from overwriting admin-configured slot changes on restart.
+    const gwalorSlotCount = await prisma.slotConfiguration.count({
+      where: { testId: test.id, locationId: gwalior.id }
+    });
+    if (gwalorSlotCount === 0) {
+      for (const [index, [label, capacity]] of slots.entries()) {
+        await prisma.slotConfiguration.upsert({
+          where: { testId_locationId_dayOfWeek_label: { testId: test.id, locationId: gwalior.id, dayOfWeek: "All", label } },
+          update: {},
+          create: { testId: test.id, locationId: gwalior.id, dayOfWeek: "All", label, capacity, sortOrder: index }
+        });
+      }
+    }
+
+    const delhiSlotCount = await prisma.slotConfiguration.count({
+      where: { testId: test.id, locationId: delhi.id }
+    });
+    if (delhiSlotCount === 0) {
+      for (const [index, [label, capacity]] of slots.entries()) {
+        await prisma.slotConfiguration.upsert({
+          where: { testId_locationId_dayOfWeek_label: { testId: test.id, locationId: delhi.id, dayOfWeek: "All", label } },
+          update: {},
+          create: { testId: test.id, locationId: delhi.id, dayOfWeek: "All", label, capacity: capacity + 2, sortOrder: index }
+        });
+      }
     }
   }
 }

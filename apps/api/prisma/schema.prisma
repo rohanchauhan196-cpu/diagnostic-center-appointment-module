@@ -46,11 +46,14 @@ model User {
   canCreateAppointments Boolean @default(false)
   createdNotices Notice[]      @relation("CreatedNotices")
   noticeReads    NoticeRead[]  @relation("ReadNotices")
+  createdDateBlocks TestDateBlock[] @relation("CreatedDateBlocks")
 }
 
 model TestType {
   id                String                  @id @default(cuid())
   name              String                  @unique
+  color             String?
+  sortOrder         Int                     @default(0)
   active            Boolean                 @default(true)
   instructions      String?
   slots             SlotConfiguration[]
@@ -59,6 +62,7 @@ model TestType {
   workDays          String[]                @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
   locationSchedules TestLocationSchedule[]
   notices           Notice[]
+  dateBlocks        TestDateBlock[]
 }
 
 model Location {
@@ -76,6 +80,7 @@ model Location {
   users             User[]
   locationSchedules TestLocationSchedule[]
   notices           Notice[]
+  dateBlocks        TestDateBlock[]
 }
 
 model SlotConfiguration {
@@ -83,6 +88,8 @@ model SlotConfiguration {
   testId     String
   locationId String?
   label      String
+  /// Slot start time as "HH:mm" (24h, center timezone). Null = parsed from label.
+  startTime  String?
   sortOrder  Int
   capacity   Int
   active     Boolean   @default(true)
@@ -121,6 +128,8 @@ model Appointment {
   subTest          String?
   isPregnant       Boolean?
   preferredDoctor  String?
+  scanName         String?
+  prescriptionUrl  String?
   locationId       String?
   createdById      String
   totalPrice       Float?
@@ -228,4 +237,28 @@ model ProName {
   name      String   @unique
   isCustom  Boolean  @default(false)
   createdAt DateTime @default(now())
+}
+
+model DeletedProName {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  deletedAt DateTime @default(now())
+}
+
+/// Blocks all bookings for a specific (test, date) or (test, location, date) combination.
+/// When locationId is null, the block applies to ALL locations for that test on that date.
+model TestDateBlock {
+  id         String    @id @default(cuid())
+  testId     String
+  locationId String?   // null = block at all centers
+  date       DateTime  // stored as UTC midnight (same as appointmentDate)
+  reason     String?   // optional message shown to users
+  createdById String
+  createdAt  DateTime  @default(now())
+  test       TestType  @relation(fields: [testId], references: [id], onDelete: Cascade)
+  location   Location? @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  createdBy  User      @relation("CreatedDateBlocks", fields: [createdById], references: [id])
+
+  @@unique([testId, locationId, date])
+  @@index([testId, date])
 }

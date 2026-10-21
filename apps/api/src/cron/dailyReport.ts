@@ -80,7 +80,6 @@ function createTransporter() {
   if (!host || !user || !pass) {
     throw new Error("[CRON] SMTP credentials (SMTP_HOST, SMTP_USER, SMTP_PASS) not configured.");
   }
-
   const isResend = (host && host.includes("resend")) || user === "resend" || pass?.startsWith("re_") || !!process.env.RESEND_API_KEY;
   const finalHost = isResend ? "smtp.resend.com" : host;
   const finalPort = isResend ? 587 : Number(port || 587);
@@ -298,6 +297,7 @@ export async function sendPaschimViharMorningReport() {
   console.log(`[CRON] Paschim Vihar morning report sent to ${recipients.join(", ")} ✓ (${appointments.length} appts)`);
   return { ok: true, recipients, count: appointments.length };
 }
+
 
 // Backward compatibility aliases
 export const sendDailyReports = sendMidnightAllLocationsReport;
